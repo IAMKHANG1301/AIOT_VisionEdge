@@ -4,23 +4,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-// Wi-Fi Config
-#define WIFI_SSID "YOUR_WIFI_SSID"
-#define WIFI_PASS "YOUR_WIFI_PASS"
-
-// Discord Webhook
-#define DISCORD_WEBHOOK_URL "YOUR_DISCORD_WEBHOOK_URL"
-
-// Hugging Face Space API (Thay thế cho Gemini/STT/TTS API trực tiếp)
-#define HF_SPACE_API_URL "https://your-space-name.hf.space/api/dialogue"
-
-// Web Dashboard API
-#define WEB_DASHBOARD_URL "http://YOUR_SERVER_IP/api/logs"
 
 /**
  * @brief Initialize NVS and connect to Wi-Fi
@@ -41,6 +29,29 @@ void network_send_discord_alert(const uint8_t *image_buffer, size_t image_len, c
  * @param status "Success" or "Failed"
  */
 void network_send_access_log(const char *id, const char *status);
+
+/**
+ * @brief Upload an image to Hugging Face
+ * @param filepath Path to the image file (e.g. /sdcard/snapshot.jpg)
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t upload_image_to_hf(const char* filepath);
+
+/**
+ * @brief Upload an audio file to Hugging Face
+ * @param filepath Path to the audio file (e.g. /sdcard/test_mic.raw)
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t upload_audio_to_hf(const char* filepath);
+
+/**
+ * @brief Upload raw PCM audio buffer to Hugging Face WebSocket directly from RAM
+ */
+esp_err_t upload_audio_to_hf_buffer(const uint8_t *pcm_buf, size_t pcm_size);
+
+void* hf_ws_connect(void);
+void hf_ws_disconnect(void *client);
+void hf_ws_send_text(void *client_handle, const char *text);
 
 /**
  * @brief Gửi file âm thanh WAV lên Hugging Face Space để xử lý toàn trình (STT -> LLM -> TTS)

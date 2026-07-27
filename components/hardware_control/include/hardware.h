@@ -8,32 +8,7 @@
 extern "C" {
 #endif
 
-// Define GPIOs based on typical ESP32-S3 boards. 
-// Can be customized later based on actual wiring.
-#define RELAY_PIN       GPIO_NUM_1
-#define BUZZER_PIN      GPIO_NUM_2
-
-// Sonar (HC-SR04)
-#define SONAR_TRIG_PIN  GPIO_NUM_3
-#define SONAR_ECHO_PIN  GPIO_NUM_8
-#define SONAR_THRESHOLD_CM 100 // Detect person if closer than 1 meter (100 cm)
-
-// Keypad Ma trận 4x4
-#define KEYPAD_ROW0     GPIO_NUM_41
-#define KEYPAD_ROW1     GPIO_NUM_42
-#define KEYPAD_ROW2     GPIO_NUM_43
-#define KEYPAD_ROW3     GPIO_NUM_0
-#define KEYPAD_COL0     GPIO_NUM_45
-#define KEYPAD_COL1     GPIO_NUM_46
-#define KEYPAD_COL2     GPIO_NUM_47
-#define KEYPAD_COL3     GPIO_NUM_48
-
-// Màn hình TFT ST7789 (SPI)
-#define TFT_SPI_MOSI    GPIO_NUM_19
-#define TFT_SPI_SCLK    GPIO_NUM_20
-#define TFT_CS_PIN      GPIO_NUM_21
-#define TFT_DC_PIN      GPIO_NUM_38
-#define TFT_RST_PIN     GPIO_NUM_39
+#include "board_config.h"
 
 /**
  * @brief Initialize all hardware pins (Relay, Buzzer, Sonar, Keypad, TFT)
@@ -41,9 +16,20 @@ extern "C" {
 void hardware_init(void);
 
 /**
+ * @brief Initialize the SD Card (SDMMC 1-bit mode) and mount FAT filesystem
+ * @return true if mounted successfully, false otherwise
+ */
+bool sd_card_init(void);
+
+/**
  * @brief Activate the relay to open the door for 5 seconds
  */
 void open_door(void);
+
+/**
+ * @brief Force close the relay door lock
+ */
+void close_door(void);
 
 /**
  * @brief Trigger the buzzer alarm

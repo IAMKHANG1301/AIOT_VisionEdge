@@ -35,3 +35,12 @@ venv/
 *.swp
 *~
 Thumbs.db
+
+# Secrets
+secrets.h
+
+# Local LSP Cache
+.clangd/
+
+# Reference repositories (comment out if you want to push this to your repo)
+xiaozhi-esp32/

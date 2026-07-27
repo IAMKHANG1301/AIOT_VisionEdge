@@ -8,9 +8,11 @@
 extern "C" {
 #endif
 
-#define FACE_VECTOR_SIZE 128
-#define THRESHOLD_DISTANCE 0.65f
-#define THRESHOLD_SMILE_RATIO 1.15f
+#include "board_config.h"
+
+#define FACE_VECTOR_SIZE 512
+#define THRESHOLD_DISTANCE 0.60f
+#define THRESHOLD_SMILE_RATIO 0.88f
 
 typedef struct {
     float vector[FACE_VECTOR_SIZE];
@@ -25,9 +27,9 @@ typedef enum {
 } vision_state_t;
 
 /**
- * @brief Initialize the camera (OV2640) and vision models (ESP-WHO)
+ * @brief Initialize the camera peripheral
  */
-void vision_init(void);
+bool vision_init(void);
 
 /**
  * @brief Capture a frame, run face detection and recognition
@@ -48,6 +50,16 @@ bool vision_add_known_face(int id, face_vector_t *vec);
  * @return true if smile detected, false otherwise
  */
 bool vision_check_liveness(void);
+
+/**
+ * @brief Start a simple local Web Server for MJPEG streaming
+ */
+void vision_start_web_server(void);
+
+/**
+ * @brief Get the active HTTP server handle (returns httpd_handle_t cast to void*)
+ */
+void* vision_get_web_server_handle(void);
 
 #ifdef __cplusplus
 }

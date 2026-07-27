@@ -1,3 +1,3 @@
 idf_component_register(SRCS "network.c"
                        INCLUDE_DIRS "include"
-                       REQUIRES esp_http_client esp_wifi nvs_flash)
+                       REQUIRES esp_http_client esp_websocket_client esp_wifi nvs_flash config_manager esp-tls mbedtls)
