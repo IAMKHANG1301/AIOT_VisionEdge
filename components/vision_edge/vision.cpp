@@ -484,7 +484,7 @@ static void ai_task(void *arg) {
                 esp_err_t err = db_person_add(person_name, emb.get_element_ptr(), s_snapshot_buf, s_snapshot_len, created_id);
                 if (err == ESP_OK) {
                     s_enrolled_person_ids.push_back(std::string(created_id));
-                    ESP_LOGI(TAG, "ENROLL SUCCESS: Registered Person [%s] - %s", created_id, person_name);
+                    ESP_LOGI(TAG, "[WEB] Thêm người quen thành công: ID = %s, Tên = %s", created_id, person_name);
                     s_enroll_result = 1;
                     
                     // MQTT: Gửi thông báo thành công về cho Vercel lưu database
@@ -494,12 +494,18 @@ static void ai_task(void *arg) {
                         person_name, created_id);
                     mqtt_publish_status(mqtt_payload);
                 } else {
-                    ESP_LOGE(TAG, "ENROLL: Failed to write Database to SD Card");
+                    ESP_LOGE(TAG, "[WEB] Thêm người quen thất bại: Lỗi ghi SD Card");
                     s_enroll_result = -2;
+                    char mqtt_payload[256];
+                    snprintf(mqtt_payload, sizeof(mqtt_payload), "{\"action\":\"enroll_face\",\"status\":\"error\",\"message\":\"Lỗi ghi SD Card\"}");
+                    mqtt_publish_status(mqtt_payload);
                 }
             } else {
-                ESP_LOGW(TAG, "ENROLL: enroll_id returned no new face entry.");
+                ESP_LOGW(TAG, "[WEB] Thêm người quen thất bại: Không nhận diện được khuôn mặt");
                 s_enroll_result = -1;
+                char mqtt_payload[256];
+                snprintf(mqtt_payload, sizeof(mqtt_payload), "{\"action\":\"enroll_face\",\"status\":\"error\",\"message\":\"Không nhận diện được khuôn mặt\"}");
+                mqtt_publish_status(mqtt_payload);
             }
             if (s_recognizer_mutex) xSemaphoreGive(s_recognizer_mutex);
             s_enroll_requested = false;
@@ -1252,9 +1258,17 @@ bool vision_delete_enrolled_face(const char* person_id) {
     if (found) {
         // Xóa dữ liệu cứng trên Thẻ nhớ SD (gọi hàm của db_manager)
         db_person_delete(person_id);
-        ESP_LOGI(TAG, "MQTT: Đã xóa toàn bộ dữ liệu %s khỏi Thẻ SD.", person_id);
+        ESP_LOGI(TAG, "[WEB] Xóa người quen thành công: ID = %s", person_id);
+        
+        char mqtt_payload[128];
+        snprintf(mqtt_payload, sizeof(mqtt_payload), "{\"action\":\"delete_face\",\"status\":\"success\",\"id\":\"%s\"}", person_id);
+        mqtt_publish_status(mqtt_payload);
     } else {
-        ESP_LOGW(TAG, "MQTT: Không tìm thấy khuôn mặt ID %s để xóa.", person_id);
+        ESP_LOGW(TAG, "[WEB] Xóa người quen thất bại: Không tìm thấy ID %s", person_id);
+        
+        char mqtt_payload[128];
+        snprintf(mqtt_payload, sizeof(mqtt_payload), "{\"action\":\"delete_face\",\"status\":\"error\",\"message\":\"Không tìm thấy khuôn mặt %s\"}", person_id);
+        mqtt_publish_status(mqtt_payload);
     }
     
     return found;
