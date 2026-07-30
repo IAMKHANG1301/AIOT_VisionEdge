@@ -10,6 +10,7 @@
 #include "vision.h"
 #include "audio.h"
 #include "network.h"
+#include "mqtt_service.h"
 
 static const char *TAG = "MAIN";
 
@@ -160,6 +161,15 @@ extern "C" void app_main(void) {
 
     // 2. Network — connects WiFi, provides IP for Web UI access
     network_init();
+    
+    // Register MQTT Callbacks
+    mqtt_set_open_door_cb(open_door);
+    mqtt_set_delete_face_cb([](const char* id) {
+        vision_delete_enrolled_face(id);
+    });
+    mqtt_set_enroll_face_cb([](const char* name) {
+        vision_trigger_remote_enroll(name);
+    });
 
     // 3. SD Card — must be mounted before audio recording or face storage
     bool sd_ok = sd_card_init();

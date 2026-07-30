@@ -2,10 +2,16 @@
 #include "mqtt_client.h"
 #include "esp_log.h"
 #include "cJSON.h"
-#include "hardware.h"
-#include "vision.h"
 #include "esp_mac.h"
 #include <string.h>
+
+static mqtt_open_door_cb_t s_open_door_cb = NULL;
+static mqtt_delete_face_cb_t s_delete_face_cb = NULL;
+static mqtt_enroll_face_cb_t s_enroll_face_cb = NULL;
+
+void mqtt_set_open_door_cb(mqtt_open_door_cb_t cb) { s_open_door_cb = cb; }
+void mqtt_set_delete_face_cb(mqtt_delete_face_cb_t cb) { s_delete_face_cb = cb; }
+void mqtt_set_enroll_face_cb(mqtt_enroll_face_cb_t cb) { s_enroll_face_cb = cb; }
 
 static const char *TAG = "MQTT_SVC";
 
@@ -34,13 +40,13 @@ static void handle_mqtt_command(const char* payload, int len) {
             
             if (strcmp(action->valuestring, "open_door") == 0) {
                 ESP_LOGI(TAG, "Lệnh Mở Cửa (MQTT)");
-                open_door();
+                if (s_open_door_cb) s_open_door_cb();
             } 
             else if (strcmp(action->valuestring, "delete_face") == 0) {
                 cJSON *id_item = cJSON_GetObjectItem(root, "id");
                 if (id_item && id_item->valuestring) {
                     ESP_LOGI(TAG, "Lệnh Xóa Khuôn Mặt: %s", id_item->valuestring);
-                    vision_delete_enrolled_face(id_item->valuestring);
+                    if (s_delete_face_cb) s_delete_face_cb(id_item->valuestring);
                 } else {
                     ESP_LOGW(TAG, "Lệnh delete_face thiếu tham số 'id'");
                 }
@@ -49,7 +55,7 @@ static void handle_mqtt_command(const char* payload, int len) {
                 cJSON *name_item = cJSON_GetObjectItem(root, "name");
                 if (name_item && name_item->valuestring) {
                     ESP_LOGI(TAG, "Lệnh Enroll Remote: %s", name_item->valuestring);
-                    vision_trigger_remote_enroll(name_item->valuestring);
+                    if (s_enroll_face_cb) s_enroll_face_cb(name_item->valuestring);
                 } else {
                     ESP_LOGW(TAG, "Lệnh enroll_face thiếu tham số 'name'");
                 }
