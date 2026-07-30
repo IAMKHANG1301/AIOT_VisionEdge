@@ -7,7 +7,6 @@
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
-#include "mqtt_service.h"
 
 // For TFT SPI standard interface
 #include "driver/spi_master.h"
@@ -121,11 +120,6 @@ void open_door(void) {
     tft_display_status("DOOR OPENING");
     ESP_LOGI(TAG, "Opening Door... (Active LOW relay OD: IN=0)");
     ESP_LOGI(TAG, "[WEB] Mở cửa thành công");
-    
-    // Báo MQTT mở cửa
-    char mqtt_payload[128];
-    snprintf(mqtt_payload, sizeof(mqtt_payload), "{\"action\":\"open_door\",\"status\":\"success\",\"message\":\"Cửa đã mở thành công\"}");
-    mqtt_publish_status(mqtt_payload);
     
     gpio_set_level(RELAY_PIN, 0);   // Open-Drain: 0 = Pull to GND -> Relay ON
     

@@ -163,7 +163,13 @@ extern "C" void app_main(void) {
     network_init();
     
     // Register MQTT Callbacks
-    mqtt_set_open_door_cb(open_door);
+    mqtt_set_open_door_cb([]() {
+        open_door();
+        // Báo MQTT mở cửa
+        char mqtt_payload[128];
+        snprintf(mqtt_payload, sizeof(mqtt_payload), "{\"action\":\"open_door\",\"status\":\"success\",\"message\":\"Cửa đã mở thành công\"}");
+        mqtt_publish_status(mqtt_payload);
+    });
     mqtt_set_delete_face_cb([](const char* id) {
         vision_delete_enrolled_face(id);
     });
