@@ -14,6 +14,13 @@
 #include <sys/stat.h>
 #include "secrets.h"
 #include "esp_heap_caps.h"
+#include "cJSON.h"
+#include "esp_mac.h"
+
+#include "network.h"
+#include "config_manager.h"
+#include "supabase_config.h"
+#include "mqtt_service.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_crt_bundle.h"
@@ -51,6 +58,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "=================================================");
         ESP_LOGI(TAG, "CONNECTED! IP ADDRESS: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "=================================================");
+        
+        static bool s_mqtt_started = false;
+        if (!s_mqtt_started) {
+            mqtt_app_start();
+            s_mqtt_started = true;
+        }
     }
 }
 

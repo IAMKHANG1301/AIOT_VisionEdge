@@ -14,10 +14,12 @@
 #include "img_converters.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
-#include "esp_timer.h"
-#include "esp_timer.h"
-
+#include "web_ui.h"
+#include "db_manager.h"
+#include "mqtt_service.h"
 #include "network.h"
+
+extern "C" {
 #include "supabase_client.h"
 
 #pragma GCC diagnostic push
@@ -484,6 +486,13 @@ static void ai_task(void *arg) {
                     s_enrolled_person_ids.push_back(std::string(created_id));
                     ESP_LOGI(TAG, "ENROLL SUCCESS: Registered Person [%s] - %s", created_id, person_name);
                     s_enroll_result = 1;
+                    
+                    // MQTT: Gửi thông báo thành công về cho Vercel lưu database
+                    char mqtt_payload[256];
+                    snprintf(mqtt_payload, sizeof(mqtt_payload), 
+                        "{\"status\":\"enroll_success\",\"name\":\"%s\",\"id\":\"%s\"}", 
+                        person_name, created_id);
+                    mqtt_publish_status(mqtt_payload);
                 } else {
                     ESP_LOGE(TAG, "ENROLL: Failed to write Database to SD Card");
                     s_enroll_result = -2;
@@ -1213,4 +1222,50 @@ bool vision_add_known_face(int id, face_vector_t *vec) {
     }
     ESP_LOGE(TAG, "vision_add_known_face: Failed to write SD at %s", path);
     return false;
+}
+
+bool vision_delete_enrolled_face(const char* person_id) {
+    if (!person_id) return false;
+    bool found = false;
+    
+    if (s_recognizer_mutex) xSemaphoreTake(s_recognizer_mutex, portMAX_DELAY);
+    
+    int index_to_delete = -1;
+    for (size_t i = 0; i < s_enrolled_person_ids.size(); i++) {
+        if (s_enrolled_person_ids[i] == person_id) {
+            index_to_delete = i + 1; // Face ID is 1-indexed in esp-dl
+            found = true;
+            break;
+        }
+    }
+    
+    if (found && s_recognizer) {
+        // Xóa khuôn mặt khỏi RAM
+        s_recognizer->delete_id(index_to_delete, false);
+        // Xóa ID khỏi danh sách mapping
+        s_enrolled_person_ids.erase(s_enrolled_person_ids.begin() + (index_to_delete - 1));
+        ESP_LOGI(TAG, "MQTT: Đã xóa khuôn mặt ID %s khỏi RAM.", person_id);
+    }
+    
+    if (s_recognizer_mutex) xSemaphoreGive(s_recognizer_mutex);
+
+    if (found) {
+        // Xóa dữ liệu cứng trên Thẻ nhớ SD (gọi hàm của db_manager)
+        db_person_delete(person_id);
+        ESP_LOGI(TAG, "MQTT: Đã xóa toàn bộ dữ liệu %s khỏi Thẻ SD.", person_id);
+    } else {
+        ESP_LOGW(TAG, "MQTT: Không tìm thấy khuôn mặt ID %s để xóa.", person_id);
+    }
+    
+    return found;
+}
+
+void vision_trigger_remote_enroll(const char* name) {
+    if (!name) return;
+    strncpy(s_enroll_name, name, sizeof(s_enroll_name) - 1);
+    s_enroll_name[sizeof(s_enroll_name) - 1] = '\0';
+    
+    s_enroll_result = 0;
+    s_enroll_requested = true;
+    ESP_LOGI(TAG, "MQTT: Bắt đầu tiến trình Remote Enroll cho '%s'. Vui lòng nhìn vào Camera...", s_enroll_name);
 }

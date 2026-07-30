@@ -61,6 +61,19 @@ void vision_start_web_server(void);
  */
 void* vision_get_web_server_handle(void);
 
+/**
+ * @brief Tự động xóa khuôn mặt có ID được chỉ định khỏi bộ nhớ và thẻ SD
+ * @param person_id ID của người cần xóa (vd: "P3")
+ * @return true nếu xóa thành công
+ */
+bool vision_delete_enrolled_face(const char* person_id);
+
+/**
+ * @brief Kích hoạt chế độ Enroll khuôn mặt từ xa qua MQTT
+ * @param name Tên của người cần đăng ký
+ */
+void vision_trigger_remote_enroll(const char* name);
+
 #ifdef __cplusplus
 }
 #endif
