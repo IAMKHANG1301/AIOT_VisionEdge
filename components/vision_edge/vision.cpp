@@ -16,8 +16,9 @@
 #include "esp_timer.h"
 #include "esp_timer.h"
 #include "esp_timer.h"
-#include "test_interface.h"
+
 #include "network.h"
+#include "supabase_client.h"
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat"
@@ -86,32 +87,7 @@ static volatile float s_smooth_ratio = -1.0f;
 static volatile float s_slow_baseline_ratio = -1.0f;
 static volatile int64_t s_known_detected_start_time = 0;
 
-static bool save_snapshot_to_sd_from_psram(const char* label) {
-    if (!s_yuv_copy_buf || s_yuv_copy_w == 0 || s_yuv_copy_h == 0) return false;
-    size_t yuv_len = (size_t)s_yuv_copy_w * s_yuv_copy_h * 2;
-    uint8_t *jpg_buf = NULL;
-    size_t jpg_len = 0;
-    bool ok = fmt2jpg(s_yuv_copy_buf, yuv_len, s_yuv_copy_w, s_yuv_copy_h, PIXFORMAT_YUV422, 30, &jpg_buf, &jpg_len);
-    if (ok && jpg_buf && jpg_len > 0) {
-        const char *filepath = "/sdcard/snapshot.jpg";
-        FILE *f = fopen(filepath, "wb");
-        if (f) {
-            fwrite(jpg_buf, 1, jpg_len, f);
-            fclose(f);
-            ESP_LOGI(TAG, "Saved %s snapshot to %s (%zu bytes, from PSRAM copy)", label, filepath, jpg_len);
-            free(jpg_buf);
-            return true;
-        } else {
-            ESP_LOGE(TAG, "Failed to open %s for writing!", filepath);
-        }
-        free(jpg_buf);
-    } else {
-        ESP_LOGE(TAG, "Snapshot compression (fmt2jpg from PSRAM) FAILED for %s", label);
-    }
-    return false;
-}
-
-static void upload_and_cleanup_snapshot(const char* label) {
+static void bg_upload_task(void* pv) {
     const char *filepath = "/sdcard/snapshot.jpg";
     esp_err_t upload_result = upload_image_to_hf(filepath);
     if (upload_result == ESP_OK) {
@@ -120,6 +96,40 @@ static void upload_and_cleanup_snapshot(const char* label) {
         ESP_LOGW(TAG, "Image upload FAILED (err=%d) — deleting %s", upload_result, filepath);
     }
     remove(filepath);
+    vTaskDelete(NULL);
+}
+
+static bool trigger_snapshot_and_upload(const char* log_label, const char* person_id, const char* hf_label) {
+    if (!s_yuv_copy_buf || s_yuv_copy_w == 0 || s_yuv_copy_h == 0) return false;
+    size_t yuv_len = (size_t)s_yuv_copy_w * s_yuv_copy_h * 2;
+    uint8_t *jpg_buf = NULL;
+    size_t jpg_len = 0;
+    // Nén ảnh ra JPEG (từ YUV422 copy buf)
+    bool ok = fmt2jpg(s_yuv_copy_buf, yuv_len, s_yuv_copy_w, s_yuv_copy_h, PIXFORMAT_YUV422, 30, &jpg_buf, &jpg_len);
+    if (ok && jpg_buf && jpg_len > 0) {
+        // 1. Thêm Log vào DB (và gọi API Supabase)
+        db_log_add(log_label, person_id, jpg_buf, jpg_len);
+
+        // 2. Lưu file ra thẻ nhớ để HuggingFace WebSocket task đọc
+        const char *filepath = "/sdcard/snapshot.jpg";
+        FILE *f = fopen(filepath, "wb");
+        if (f) {
+            fwrite(jpg_buf, 1, jpg_len, f);
+            fclose(f);
+            ESP_LOGI(TAG, "Saved %s snapshot to %s (%zu bytes, from PSRAM copy)", hf_label, filepath, jpg_len);
+            
+            // Khởi tạo luồng ngầm gửi ảnh lên HuggingFace
+            xTaskCreate(bg_upload_task, "bg_upload", 10240, NULL, 4, NULL);
+        } else {
+            ESP_LOGE(TAG, "Failed to open %s for writing!", filepath);
+        }
+        
+        free(jpg_buf);
+        return true;
+    } else {
+        ESP_LOGE(TAG, "Snapshot compression FAILED for %s", log_label);
+    }
+    return false;
 }
 
 static volatile int64_t s_last_face_seen_time = 0;
@@ -335,8 +345,6 @@ static void ai_task(void *arg) {
             continue;
         }
 
-        bool need_upload = false;
-        const char *upload_label = NULL;
 
         // --- Kiểm tra tính hợp lệ của frame YUV422 ---
         // OV2640 xuất YUV422 native tại QVGA: 320*240*2 = 153600 bytes
@@ -564,20 +572,35 @@ static void ai_task(void *arg) {
                         s_liveness_passed = false;
                         s_spoofing_detected = false;
                         s_smile_consecutive_frames = 0;
-                        ESP_LOGI(TAG, "KNOWN '%s' - Challenge START. Giữ mặt lạnh 5s! baseline=%.3f",
-                                 recognized_name, s_initial_ratio);
+                        if (s_liveness_enabled) {
+                            ESP_LOGI(TAG, "KNOWN '%s' - Challenge START. Giữ mặt lạnh 5s! baseline=%.3f",
+                                     recognized_name, s_initial_ratio);
+                        } else {
+                            ESP_LOGI(TAG, "KNOWN '%s' - Liveness DISABLED. Waiting 2s to unlock...", recognized_name);
+                        }
                     }
 
                     if (!s_liveness_passed && !s_spoofing_detected) {
                         int elapsed_sec = (int)((now_us - s_known_detected_start_time) / 1000000LL);
                         
-                        // Log delta mỗi frame để theo dõi
-                        ESP_LOGI(TAG, "[Challenge] t=%ds | delta=%.3f", elapsed_sec, delta);
+                        if (s_liveness_enabled) {
+                            // Log delta mỗi frame để theo dõi
+                            ESP_LOGI(TAG, "[Challenge] t=%ds | delta=%.3f", elapsed_sec, delta);
+                        }
 
-                        if (elapsed_sec < 5) {
-                            // =================================================
-                            // GIAI ĐOẠN 1 (0-5s): BUỘC MẶT LẠNH
-                            // Không được cười. Bắt sống video đang cười / gif / TikTok.
+                        if (!s_liveness_enabled) {
+                            if (elapsed_sec >= 2) {
+                                s_liveness_passed = true;
+                                s_spoofing_detected = false;
+                                trigger_snapshot_and_upload("known", s_recognized_person_id, "KNOWN");
+                                open_door();
+                                ESP_LOGI(TAG, "🔓 Liveness Disabled. DOOR UNLOCKED directly for %s!", recognized_name);
+                            }
+                        } else {
+                            if (elapsed_sec < 5) {
+                                // =================================================
+                                // GIAI ĐOẠN 1 (0-5s): BUỘC MẶT LẠNH
+                                // Không được cười. Bắt sống video đang cười / gif / TikTok.
                             // =================================================
                             if (delta > NEUTRAL_MAX_THRESHOLD) {
                                 // Phát hiện môi đang chạy -> Còi ngay
@@ -590,11 +613,7 @@ static void ai_task(void *arg) {
                                 
                                 static int64_t last_spoofing_upload = 0;
                                 if ((esp_timer_get_time() - last_spoofing_upload) > 10000000LL) {
-                                    db_log_add("3. Cảnh báo giả mạo (Video/GIF đang cười)", NULL, s_snapshot_buf, s_snapshot_len);
-                                    if (save_snapshot_to_sd_from_psram("SPOOFING")) {
-                                        need_upload = true;
-                                        upload_label = "SPOOFING";
-                                    }
+                                    trigger_snapshot_and_upload("spoofing", NULL, "SPOOFING");
                                     last_spoofing_upload = esp_timer_get_time();
                                 }
                             }
@@ -613,10 +632,10 @@ static void ai_task(void *arg) {
                                     s_liveness_passed = true;
                                     s_spoofing_detected = false;
                                     stop_alarm();
+                                    trigger_snapshot_and_upload("known", s_recognized_person_id, "KNOWN");
                                     open_door();
                                     ESP_LOGI(TAG, "🎉 SMILE LIVENESS PASSED! delta=%.3f in [%.2f, %.2f]. DOOR UNLOCKED!",
                                              delta, SMILE_THRESHOLD, SMILE_MAX_THRESHOLD);
-                                    db_log_add("1. Người quen mở cửa (Cười Liveness đạt)", s_recognized_person_id, s_snapshot_buf, s_snapshot_len);
                                 }
                             } else if (elapsed_sec >= 10) {
                                 // Hết 10 giây không cười -> ảnh tĩnh / giấy / mặt nạ
@@ -628,16 +647,13 @@ static void ai_task(void *arg) {
                                 
                                 static int64_t last_spoofing_upload2 = 0;
                                 if ((esp_timer_get_time() - last_spoofing_upload2) > 10000000LL) {
-                                    db_log_add("3. Cảnh báo giả mạo (Không cười)", NULL, s_snapshot_buf, s_snapshot_len);
-                                    if (save_snapshot_to_sd_from_psram("SPOOFING")) {
-                                        need_upload = true;
-                                        upload_label = "SPOOFING";
-                                    }
+                                    trigger_snapshot_and_upload("spoofing", NULL, "SPOOFING");
                                     last_spoofing_upload2 = esp_timer_get_time();
                                 }
                             } else {
                                 s_smile_consecutive_frames = 0;
                             }
+                        }
                         }
                     } else if (s_spoofing_detected) {
                         int elapsed_sec = (int)((now_us - s_known_detected_start_time) / 1000000LL);
@@ -659,18 +675,12 @@ static void ai_task(void *arg) {
                 // Only log/upload if we haven't spammed it recently (debounce using last_detection_time)
                 static int64_t last_stranger_upload = 0;
                 if ((esp_timer_get_time() - last_stranger_upload) > 10000000LL) {
-                    if (save_snapshot_to_sd_from_psram("STRANGER")) {
-                        need_upload = true;
-                        upload_label = "STRANGER";
-                    }
+                    trigger_snapshot_and_upload("unknown", NULL, "STRANGER");
                     last_stranger_upload = esp_timer_get_time();
                 }
             }
         }
 
-        if (need_upload && upload_label) {
-            upload_and_cleanup_snapshot(upload_label);
-        }
 
         // Cooldown nhỏ để cho CPU hạ nhiệt
         vTaskDelay(pdMS_TO_TICKS(80));
@@ -681,6 +691,14 @@ static void ai_task(void *arg) {
 // =============================================================================
 // HTTP HANDLERS (Chạy trên Core 0)
 // =============================================================================
+
+#include "web_ui.h"
+
+static esp_err_t index_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html; charset=UTF-8");
+    httpd_resp_send(req, index_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
 
 /**
  * @brief Enroll handler - KHÔNG block server (non-blocking polling design)
@@ -735,26 +753,26 @@ static esp_err_t enroll_handler(httpd_req_t *req) {
     s_enroll_result    = 0;
     s_enroll_requested = true;
 
-    // Poll kết quả từ AI task (chạy Core 1) – tối đa 3 giây
-    int timeout = 60; // 60 × 50ms = 3000ms
+    // Poll kết quả từ AI task (chạy Core 1) – tối đa 10 giây
+    int timeout = 200; // 200 × 50ms = 10000ms
     while (s_enroll_requested && timeout > 0) {
         vTaskDelay(pdMS_TO_TICKS(50));
         timeout--;
     }
 
-    char resp[128];
+    char resp[256];
     if (s_enroll_result == 1) {
-        snprintf(resp, sizeof(resp), "✅ Đăng ký thành công người quen: '%s'!", s_enroll_name);
+        snprintf(resp, sizeof(resp), "{\"status\":\"success\",\"message\":\"Đăng ký thành công người quen: '%s'!\"}", s_enroll_name);
     } else if (s_enroll_result == -1) {
-        snprintf(resp, sizeof(resp), "❌ Không phát hiện khuôn mặt qua hình ảnh. Hãy nhìn thẳng vào camera!");
+        snprintf(resp, sizeof(resp), "{\"status\":\"error\",\"message\":\"Không phát hiện khuôn mặt qua hình ảnh.\"}");
     } else if (s_enroll_result == -2) {
-        snprintf(resp, sizeof(resp), "❌ Lỗi ghi SD Card. Kiểm tra thẻ nhớ.");
+        snprintf(resp, sizeof(resp), "{\"status\":\"error\",\"message\":\"Lỗi ghi SD Card. Kiểm tra thẻ nhớ.\"}");
     } else {
         s_enroll_requested = false;
-        snprintf(resp, sizeof(resp), "⏱ Timeout. Camera chưa sẵn sàng hoặc không thấy mặt.");
+        snprintf(resp, sizeof(resp), "{\"status\":\"error\",\"message\":\"Timeout. Camera chưa sẵn sàng hoặc không thấy mặt.\"}");
     }
 
-    httpd_resp_set_type(req, "text/plain; charset=UTF-8");
+    httpd_resp_set_type(req, "application/json; charset=UTF-8");
     httpd_resp_send(req, resp, strlen(resp));
     return ESP_OK;
 }
@@ -826,16 +844,23 @@ static esp_err_t detect_status_handler(httpd_req_t *req) {
     } else if (current_vision_state == VISION_KNOWN_PERSON) {
         float delta = s_last_smile_ratio;
         if (s_liveness_passed) {
-            snprintf(resp, sizeof(resp), "KNOWN PERSON: %s | Liveness: PASSED 😀 (DeltaSmile: %.3f)", 
-                     recognized_name, delta);
+            if (s_liveness_enabled) {
+                snprintf(resp, sizeof(resp), "KNOWN PERSON: %s | Liveness: PASSED 😀 (DeltaSmile: %.3f)", 
+                         recognized_name, delta);
+            } else {
+                snprintf(resp, sizeof(resp), "KNOWN PERSON: %s | 🔓 DOOR UNLOCKED (Liveness OFF)", 
+                         recognized_name);
+            }
         } else {
             int elapsed_sec = 0;
             if (s_known_detected_start_time > 0) {
                 elapsed_sec = (int)((esp_timer_get_time() - s_known_detected_start_time) / 1000000LL);
             }
             if (!s_liveness_enabled) {
-                snprintf(resp, sizeof(resp), "KNOWN PERSON: %s | Liveness OFF ⏱ %ds/3s", 
-                         recognized_name, elapsed_sec);
+                int remaining = 2 - elapsed_sec;
+                if (remaining < 0) remaining = 0;
+                snprintf(resp, sizeof(resp), "KNOWN PERSON: %s | Liveness OFF ⏱ Unlocking in %ds...", 
+                         recognized_name, remaining);
             } else {
                 int remaining = 10 - elapsed_sec;
                 if (remaining < 0) remaining = 0;
@@ -901,9 +926,12 @@ static esp_err_t liveness_off_handler(httpd_req_t *req) {
 // REST API: Lấy danh sách bảng NguoiQuen
 static esp_err_t api_persons_get_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     cJSON *db = db_person_get_all_json();
     char *out = cJSON_PrintUnformatted(db);
     cJSON_Delete(db);
+    
+    ESP_LOGI(TAG, "api_persons_get_handler returning: %s", out ? out : "NULL");
     
     httpd_resp_set_type(req, "application/json; charset=UTF-8");
     if (out) {
@@ -959,8 +987,56 @@ static esp_err_t api_logs_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static void door_open_task(void *pv) {
+    open_door();
+    vTaskDelete(NULL);
+}
+
+static esp_err_t api_door_open_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    ESP_LOGI(TAG, "API: /api/door_open called");
+    xTaskCreate(door_open_task, "door_open", 2048, NULL, 5, NULL);
+    httpd_resp_send(req, "OK: Door Opening", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t api_door_close_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    ESP_LOGI(TAG, "API: /api/door_close called");
+    close_door();
+    httpd_resp_send(req, "OK: Door Closed", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 // =============================================================================
-// HTTP HANDLERS (Chạy trên Core 0) - API Vision
+// REMOTE COMMAND POLLING TASK (Core 0)
+// =============================================================================
+/* TẠM THỜI VÔ HIỆU HÓA THEO YÊU CẦU TEST PHẦN CỨNG
+static void remote_command_poll_task(void *pv) {
+    char id_buf[32];
+    char cmd_buf[32];
+    while (1) {
+        if (!network_is_connected()) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        if (supabase_get_pending_command(id_buf, sizeof(id_buf), cmd_buf, sizeof(cmd_buf)) == ESP_OK) {
+            ESP_LOGI(TAG, "Received remote command: %s (ID: %s)", cmd_buf, id_buf);
+            if (strcmp(cmd_buf, "open_door") == 0) {
+                open_door(); // This blocks for 5 seconds
+                supabase_update_command_status(id_buf, "completed");
+            } else {
+                ESP_LOGW(TAG, "Unknown remote command: %s", cmd_buf);
+                supabase_update_command_status(id_buf, "failed");
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+*/
+
+// =============================================================================
+// CAMERA & I2C INIT
 // =============================================================================
 
 // =============================================================================
@@ -1059,6 +1135,9 @@ bool vision_init(void) {
         return false;
     }
 
+    // Tạo Remote Command Poll Task trên Core 0
+    // TẠM VÔ HIỆU HÓA: xTaskCreatePinnedToCore(remote_command_poll_task, "remote_poll", 4096, NULL, 3, NULL, 0);
+
     ESP_LOGI(TAG, "Vision initialized. PSRAM free: %d bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     return true;
 }
@@ -1072,8 +1151,10 @@ void vision_start_web_server(void) {
     cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout  = 10;
     cfg.send_wait_timeout  = 30;  // tăng lên để tránh EAGAIN khi poll nhanh
+    cfg.stack_size         = 10240; // Tăng stack để HTTP client gọi Supabase không bị tràn
 
     httpd_uri_t uris[] = {
+        { .uri = "/",                   .method = HTTP_GET, .handler = index_handler,               .user_ctx = NULL },
         { .uri = "/enroll",             .method = HTTP_GET, .handler = enroll_handler,              .user_ctx = NULL },
         { .uri = "/ai_on",              .method = HTTP_GET, .handler = ai_on_handler,               .user_ctx = NULL },
         { .uri = "/ai_off",             .method = HTTP_GET, .handler = ai_off_handler,              .user_ctx = NULL },
@@ -1085,6 +1166,8 @@ void vision_start_web_server(void) {
         { .uri = "/api/persons/delete", .method = HTTP_GET, .handler = api_persons_delete_handler,  .user_ctx = NULL },
         { .uri = "/api/logs",           .method = HTTP_GET, .handler = api_logs_get_handler,        .user_ctx = NULL },
         { .uri = "/live_frame.jpg",     .method = HTTP_GET, .handler = live_frame_handler,          .user_ctx = NULL },
+        { .uri = "/api/door_open",      .method = HTTP_GET, .handler = api_door_open_handler,       .user_ctx = NULL },
+        { .uri = "/api/door_close",     .method = HTTP_GET, .handler = api_door_close_handler,      .user_ctx = NULL },
     };
 
     int uri_count = sizeof(uris) / sizeof(uris[0]);
@@ -1092,7 +1175,7 @@ void vision_start_web_server(void) {
         for (int i = 0; i < uri_count; i++) {
             httpd_register_uri_handler(camera_httpd, &uris[i]);
         }
-        register_test_uris(camera_httpd);
+
         ESP_LOGI(TAG, "Web Server started on port 80.");
     } else {
         ESP_LOGE(TAG, "Web Server FAILED to start!");

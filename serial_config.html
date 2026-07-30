@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AIoT Receptionist — Cấu hình qua Cáp USB Serial</title>
+    <style>
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: #0f172a;
+            color: #f8fafc;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            box-sizing: border-box;
+        }
+        .card {
+            background: rgba(30, 41, 59, 0.8);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 24px;
+            padding: 32px;
+            width: 100%;
+            max-width: 520px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        }
+        h1 {
+            font-size: 24px;
+            font-weight: 700;
+            color: #38bdf8;
+            text-align: center;
+            margin-top: 0;
+            margin-bottom: 6px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #94a3b8;
+            font-size: 13px;
+            margin-bottom: 24px;
+        }
+        .info-box {
+            background: rgba(56, 189, 248, 0.1);
+            border: 1px solid rgba(56, 189, 248, 0.2);
+            color: #7dd3fc;
+            padding: 12px;
+            border-radius: 12px;
+            font-size: 13px;
+            margin-bottom: 24px;
+            line-height: 1.5;
+        }
+        .btn-serial {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+            color: #fff;
+            border: none;
+            border-radius: 14px;
+            font-size: 15px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 14px rgba(2, 132, 199, 0.4);
+            margin-bottom: 24px;
+        }
+        .btn-serial:hover {
+            background: linear-gradient(135deg, #0369a1 0%, #075985 100%);
+            transform: translateY(-1px);
+        }
+        .group {
+            margin-bottom: 18px;
+        }
+        label {
+            display: block;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: #38bdf8;
+            letter-spacing: 0.8px;
+            margin-bottom: 6px;
+        }
+        input {
+            width: 100%;
+            padding: 13px 16px;
+            background: rgba(15, 23, 42, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            color: #fff;
+            font-size: 14px;
+            outline: none;
+            transition: all 0.3s;
+            box-sizing: border-box;
+        }
+        input:focus {
+            border-color: #38bdf8;
+            box-shadow: 0 0 12px rgba(56, 189, 248, 0.3);
+        }
+        .btn-send {
+            width: 100%;
+            padding: 16px;
+            background: #10b981;
+            color: #0f172a;
+            border: none;
+            border-radius: 14px;
+            font-size: 16px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 10px;
+        }
+        .btn-send:hover {
+            background: #059669;
+            box-shadow: 0 0 20px rgba(16, 185, 129, 0.4);
+        }
+        .btn-send:disabled {
+            background: #334155;
+            color: #64748b;
+            cursor: not-allowed;
+            box-shadow: none;
+        }
+        #status {
+            text-align: center;
+            padding: 12px;
+            border-radius: 12px;
+            font-size: 13px;
+            font-weight: 600;
+            margin-top: 20px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>🔌 SERIAL USB CONFIG TOOL</h1>
+        <div class="subtitle">Cấu hình ESP32-S3 trực tiếp qua Cáp USB nối với Máy tính</div>
+
+        <div class="info-box">
+            📌 <b>Hướng dẫn:</b> Cắm cáp USB nối ESP32-S3 với máy tính. Bấm nút <b>Chọn Cổng USB COM</b> bên dưới ➡️ Chọn cổng COM tương ứng (ví dụ Silicon Labs CP210x hoặc USB Serial).
+        </div>
+
+        <button type="button" class="btn-serial" onclick="connectSerial()">
+            <span>🔌 Chọn & Kết Nối Cổng USB COM</span>
+        </button>
+
+        <form id="config-form" onsubmit="sendConfigSerial(event)">
+            <div class="group">
+                <label>Tên Wi-Fi (SSID)</label>
+                <input type="text" id="ssid" required placeholder="Nhập tên Wi-Fi nhà bạn...">
+            </div>
+            <div class="group">
+                <label>Mật khẩu Wi-Fi</label>
+                <input type="password" id="pass" placeholder="Mật khẩu Wi-Fi (nếu có)...">
+            </div>
+            <div class="group">
+                <label>Hugging Face Space API URL</label>
+                <input type="url" id="hf_url" required value="https://your-space-name.hf.space/api/dialogue">
+            </div>
+            <div class="group">
+                <label>Discord Webhook URL</label>
+                <input type="url" id="discord_url" placeholder="Gửi cảnh báo phát hiện người lạ...">
+            </div>
+            <div class="group">
+                <label>Dashboard API URL</label>
+                <input type="url" id="dashboard_url" placeholder="http://192.168.1.100:5000/api/logs">
+            </div>
+            <button type="submit" id="btn-submit" class="btn-send" disabled>💾 Lưu Cấu Hình Vào ESP32 (Qua Cáp USB)</button>
+        </form>
+
+        <div id="status"></div>
+    </div>
+
+    <script>
+        let port = null;
+        let writer = null;
+
+        function showStatus(text, bg, color) {
+            const div = document.getElementById('status');
+            div.innerText = text;
+            div.style.background = bg;
+            div.style.color = color;
+            div.style.display = 'block';
+        }
+
+        async function connectSerial() {
+            if (!('serial' in navigator)) {
+                alert('Trình duyệt của bạn không hỗ trợ Web Serial API. Vui lòng mở trang này trên Google Chrome hoặc Microsoft Edge!');
+                return;
+            }
+
+            try {
+                showStatus('🔍 Hãy chọn cổng USB COM trong bảng popup...', 'rgba(56, 189, 248, 0.15)', '#38bdf8');
+                port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
+
+                writer = port.writable.getWriter();
+                showStatus('✅ Đã kết nối thành công với cổng USB COM!', 'rgba(16, 185, 129, 0.15)', '#10b981');
+                document.getElementById('btn-submit').disabled = false;
+            } catch (error) {
+                showStatus('❌ Lỗi kết nối cổng COM: ' + error, 'rgba(239, 68, 68, 0.15)', '#ef4444');
+            }
+        }
+
+        async function sendConfigSerial(e) {
+            e.preventDefault();
+            if (!writer) {
+                alert('Vui lòng bấm nút Chọn & Kết Nối Cổng USB COM trước!');
+                return;
+            }
+
+            const payload = {
+                ssid: document.getElementById('ssid').value,
+                pass: document.getElementById('pass').value,
+                hf_url: document.getElementById('hf_url').value,
+                discord_url: document.getElementById('discord_url').value,
+                dashboard_url: document.getElementById('dashboard_url').value
+            };
+
+            const jsonStr = JSON.stringify(payload) + "\n";
+            const encoder = new TextEncoder();
+            const data = encoder.encode(jsonStr);
+
+            try {
+                showStatus('🚀 Đang gửi dữ liệu cấu hình qua cáp USB...', 'rgba(234, 179, 8, 0.15)', '#eab308');
+                await writer.write(data);
+                showStatus('🎉 Đã lưu thành công! ESP32-S3 đang khởi động lại để nối Wi-Fi...', 'rgba(16, 185, 129, 0.15)', '#10b981');
+            } catch (error) {
+                showStatus('❌ Lỗi gửi dữ liệu qua USB: ' + error, 'rgba(239, 68, 68, 0.15)', '#ef4444');
+            }
+        }
+    </script>
+</body>
+</html>

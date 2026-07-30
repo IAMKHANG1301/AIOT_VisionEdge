@@ -23,6 +23,7 @@
 static const char *TAG = "NETWORK";
 static app_config_t s_app_cfg;
 static int s_retry_num = 0;
+static volatile bool g_wifi_connected = false;
 #define MAXIMUM_RETRY 10
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -30,6 +31,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t* disconnected = (wifi_event_sta_disconnected_t*) event_data;
+        ESP_LOGE(TAG, "Wi-Fi Disconnected. Reason: %d", disconnected->reason);
+        g_wifi_connected = false;
         if (s_retry_num < MAXIMUM_RETRY) {
             s_retry_num++;
             ESP_LOGI(TAG, "Wi-Fi disconnected. Reconnecting (%d/%d)...", s_retry_num, MAXIMUM_RETRY);
@@ -43,15 +47,28 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         s_retry_num = 0;
+        g_wifi_connected = true;
         ESP_LOGI(TAG, "=================================================");
         ESP_LOGI(TAG, "CONNECTED! IP ADDRESS: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "=================================================");
     }
 }
 
+bool network_is_connected(void) {
+    return g_wifi_connected;
+}
+
 void network_init(void) {
     ESP_LOGI(TAG, "Initializing Wi-Fi configuration...");
     
+    // Khởi tạo NVS Flash (Rất quan trọng vì esp_wifi_init cần NVS)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
     // 1. Initialize config manager and load parameters
     config_manager_init();
     config_manager_get(&s_app_cfg);

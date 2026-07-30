@@ -1,0 +1,33 @@
+menu "AIoT Receptionist Configuration"
+
+    config WIFI_SSID
+        string "WiFi SSID"
+        default "YOUR_WIFI_SSID"
+        help
+            SSID (network name) for the ESP32 to connect to.
+
+    config WIFI_PASSWORD
+        string "WiFi Password"
+        default "YOUR_WIFI_PASS"
+        help
+            Password for the WiFi network.
+
+    config DISCORD_WEBHOOK_URL
+        string "Discord Webhook URL"
+        default "YOUR_DISCORD_WEBHOOK_URL"
+        help
+            Webhook URL to send security alerts to Discord.
+
+    config HF_SPACE_API_URL
+        string "Hugging Face Space API URL"
+        default "https://your-space-name.hf.space/api/dialogue"
+        help
+            URL for the STT/LLM/TTS processing backend on Hugging Face Spaces.
+
+    config WEB_DASHBOARD_URL
+        string "Web Dashboard API URL"
+        default "http://YOUR_SERVER_IP/api/logs"
+        help
+            URL of your web server dashboard to receive access logs.
+
+endmenu

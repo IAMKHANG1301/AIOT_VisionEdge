@@ -40,10 +40,10 @@ void audio_init(void) {
     esp_log_level_set("i2s_std", ESP_LOG_DEBUG);
 
     ESP_LOGI(TAG, "Initializing I2S full-duplex audio...");
-    ESP_LOGI(TAG, "  BCLK  = GPIO %d (shared MIC+SPK)", I2S_BCLK_PIN);
-    ESP_LOGI(TAG, "  WS    = GPIO %d (shared MIC+SPK)", I2S_WS_PIN);
-    ESP_LOGI(TAG, "  SPK   = GPIO %d (TX → MAX98357A DIN)", I2S_SPK_DOUT_PIN);
-    ESP_LOGI(TAG, "  MIC   = GPIO %d (RX ← INMP441 SD)",  I2S_MIC_DIN_PIN);
+    ESP_LOGI(TAG, "  BCLK  = GPIO %d (shared MIC+SPK)", I2S_SPK_BCLK_PIN);
+    ESP_LOGI(TAG, "  MIC   = GPIO %d (RX ← INMP441 SD)",  I2S_MIC_SD_PIN);
+    ESP_LOGI(TAG, "  SPK   = GPIO %d (TX → MAX98357A DIN)", I2S_SPK_DIN_PIN);
+    ESP_LOGI(TAG, "  MIC   = GPIO %d (RX ← INMP441 SD)",  I2S_MIC_SD_PIN);
 
     // -------------------------------------------------------------------------
     // Step 1: Create full-duplex channel pair on I2S_NUM_0
@@ -76,11 +76,10 @@ void audio_init(void) {
                         I2S_DATA_BIT_WIDTH_32BIT,  // 32-bit slot (INMP441 is 24-bit padded)
                         I2S_SLOT_MODE_STEREO),     // Stereo — ensures 50% duty cycle WS clock for MAX98357A
         .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,                // INMP441 doesn't need MCLK
-            .bclk = (gpio_num_t)I2S_BCLK_PIN,      // Bit clock → MIC SCK + SPK BCLK
-            .ws   = (gpio_num_t)I2S_WS_PIN,        // Word select → MIC WS + SPK LRC
-            .dout = (gpio_num_t)I2S_SPK_DOUT_PIN,  // Data out → MAX98357A DIN
-            .din  = (gpio_num_t)I2S_MIC_DIN_PIN,   // Data in ← INMP441 SD
+            .mclk = I2S_GPIO_UNUSED,                 .bclk = (gpio_num_t)I2S_SPK_BCLK_PIN,      // Bit clock → MIC SCK + SPK BCLK
+            .ws   = (gpio_num_t)I2S_SPK_LRC_PIN,        // Word select → MIC WS + SPK LRC
+            .dout = (gpio_num_t)I2S_SPK_DIN_PIN,  // Data out → MAX98357A DIN
+            .din  = (gpio_num_t)I2S_MIC_SD_PIN,   // Data in ← INMP441 SD
             .invert_flags = {
                 .mclk_inv = false,
                 .bclk_inv = false,

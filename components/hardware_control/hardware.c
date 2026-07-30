@@ -31,29 +31,31 @@ void hardware_init(void) {
 
     gpio_config_t io_conf = {};
     
-    // 1. Config Relay
+    // 1. Config Relay (Fix for 5V Active-LOW relays driven by 3.3V ESP32)
     gpio_reset_pin(RELAY_PIN); // Required for JTAG pin (GPIO 42) to work as normal GPIO
     io_conf.intr_type = GPIO_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.mode = GPIO_MODE_OUTPUT_OD; // OPEN-DRAIN MODE (Critical for 5V Relays)
     io_conf.pin_bit_mask = (1ULL << RELAY_PIN);
     io_conf.pull_down_en = 0;
     io_conf.pull_up_en = 0;
     gpio_config(&io_conf);
-    gpio_set_level(RELAY_PIN, 1); // Active LOW relay: HIGH = OFF (default)
+    gpio_set_level(RELAY_PIN, 1); // Open-Drain: 1 = Float (High-Z) -> Relay OFF
 
     // 2. Config Buzzer
     io_conf.pin_bit_mask = (1ULL << BUZZER_PIN);
     gpio_config(&io_conf);
     gpio_set_level(BUZZER_PIN, 0); // Default OFF
 
-    // 3. Config Sonar (HC-SR04)
+    // 3. Sonar Sensor Initial setup
+    gpio_reset_pin(SONAR_TRIG_PIN);
+    gpio_reset_pin(SONAR_ECHO_PIN); // Ensure GPIO 41 is reset from JTAG!
+    
     // Trig pin: Output
     io_conf.pin_bit_mask = (1ULL << SONAR_TRIG_PIN);
     gpio_config(&io_conf);
     gpio_set_level(SONAR_TRIG_PIN, 0);
 
     // Echo pin: Input
-    gpio_reset_pin(SONAR_ECHO_PIN); // Required for ESP32-S3 JTAG pins (GPIO 39-42) to work as normal GPIO
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pin_bit_mask = (1ULL << SONAR_ECHO_PIN);
     io_conf.pull_down_en = 1;
@@ -62,6 +64,16 @@ void hardware_init(void) {
 
 #ifdef KEYPAD_ROW0
     // 4. Config Keypad Rows (Outputs, default HIGH)
+    // Reset JTAG pins to GPIO (39-42)
+    gpio_reset_pin(KEYPAD_ROW0); // 41
+    gpio_reset_pin(KEYPAD_ROW1); // 42
+    gpio_reset_pin(KEYPAD_ROW2); // 43
+    gpio_reset_pin(KEYPAD_ROW3); // 0
+    gpio_reset_pin(KEYPAD_COL0); // 45
+    gpio_reset_pin(KEYPAD_COL1); // 46
+    gpio_reset_pin(KEYPAD_COL2); // 47
+    gpio_reset_pin(KEYPAD_COL3); // 48
+    
     io_conf.mode = GPIO_MODE_OUTPUT;
     io_conf.pull_down_en = 0;
     io_conf.pull_up_en = 0;
@@ -89,34 +101,37 @@ void hardware_init(void) {
     ESP_LOGI(TAG, "Keypad not configured (GPIOs commented out in board_config.h)");
 #endif
 
+#if defined(TFT_SPI_MOSI) && TFT_SPI_MOSI >= 0
     // 6. TFT Display ST7789 Initial setup
-    /*
-     * SPI/LCD configuration pseudocode for ESP-IDF v5:
-     * - Configure SPI bus using spi_bus_initialize().
-     * - Configure LCD Panel IO using esp_lcd_new_panel_io_spi().
-     * - Create LCD Panel driver using esp_lcd_new_panel_st7789().
-     * - Reset LCD panel and initialize.
-     */
+    gpio_reset_pin(TFT_SPI_MOSI); // 42 is JTAG MTMS
+    gpio_reset_pin(TFT_SPI_SCLK);
+    gpio_reset_pin(TFT_DC_PIN);
+#if TFT_RST_PIN >= 0
+    gpio_reset_pin(TFT_RST_PIN);
+#endif
     ESP_LOGI(TAG, "TFT ST7789 SPI interface configured on MOSI:%d, SCLK:%d, CS:%d, DC:%d, RST:%d", 
              TFT_SPI_MOSI, TFT_SPI_SCLK, TFT_CS_PIN, TFT_DC_PIN, TFT_RST_PIN);
+#else
+    ESP_LOGI(TAG, "TFT ST7789 not configured");
+#endif
 }
 
 void open_door(void) {
     tft_display_status("DOOR OPENING");
-    ESP_LOGI(TAG, "Opening Door... (Active LOW relay: IN=LOW)");
-    gpio_set_level(RELAY_PIN, 0);   // Active LOW: pull IN to LOW = relay ON
+    ESP_LOGI(TAG, "Opening Door... (Active LOW relay OD: IN=0)");
+    gpio_set_level(RELAY_PIN, 0);   // Open-Drain: 0 = Pull to GND -> Relay ON
     
     // Keep the door open for 5 seconds
     vTaskDelay(pdMS_TO_TICKS(5000)); 
     
-    gpio_set_level(RELAY_PIN, 1);   // Active LOW: pull IN to HIGH = relay OFF
+    gpio_set_level(RELAY_PIN, 1);   // Open-Drain: 1 = Float -> Relay OFF
     ESP_LOGI(TAG, "Door Closed.");
     tft_display_status("DOOR CLOSED");
 }
 
 void close_door(void) {
     ESP_LOGI(TAG, "Force Closing Door...");
-    gpio_set_level(RELAY_PIN, 1);   // Active LOW: HIGH = relay OFF
+    gpio_set_level(RELAY_PIN, 1);   // Open-Drain: 1 = Float -> Relay OFF
     tft_display_status("DOOR CLOSED");
 }
 

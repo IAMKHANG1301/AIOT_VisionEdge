@@ -16,6 +16,11 @@ extern "C" {
 void network_init(void);
 
 /**
+ * @brief Check if Wi-Fi has IP and is connected
+ */
+bool network_is_connected(void);
+
+/**
  * @brief Send security alert to Discord with an image
  * @param image_buffer Pointer to JPEG image data (NULL if only text)
  * @param image_len Length of the image data
