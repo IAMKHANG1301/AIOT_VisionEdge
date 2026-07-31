@@ -179,27 +179,25 @@ uint32_t get_sonar_distance_cm(void) {
     esp_rom_delay_us(10);
     gpio_set_level(SONAR_TRIG_PIN, 0);
 
-    // 2. Wait for Echo to go HIGH (timeout 30ms)
-    // Dùng esp_timer_get_time() và taskYIELD() thành vòng lặp nhưỚng CPU
-    // thay vì busy-wait cứng → tránh block Camera DMA và RTOS scheduler
-    int64_t deadline = esp_timer_get_time() + 30000LL; // 30ms
+    // 2. Wait for Echo to go HIGH (timeout 2ms)
+    int64_t deadline = esp_timer_get_time() + 2000LL; // 2ms
     while (gpio_get_level(SONAR_ECHO_PIN) == 0) {
         if (esp_timer_get_time() > deadline) {
-            ESP_LOGW(TAG, "Sonar Timeout: Echo pin never went HIGH. Check TRIG/ECHO wiring and 5V power.");
+            ESP_LOGW(TAG, "Sonar Timeout: Echo pin never went HIGH.");
             return 998;
         }
-        taskYIELD(); // nhường CPU cho các task khác (Camera ISR, RTOS)
+        esp_rom_delay_us(10);
     }
 
     // 3. Measure Echo HIGH duration
     int64_t start_time = esp_timer_get_time();
-    deadline = start_time + 30000LL;
+    deadline = start_time + 6000LL; // 6ms timeout (~100cm max range)
     while (gpio_get_level(SONAR_ECHO_PIN) == 1) {
         if (esp_timer_get_time() > deadline) {
             ESP_LOGW(TAG, "Sonar Timeout: Echo pin never went LOW. Out of range or no obstacle.");
             return 999;
         }
-        taskYIELD();
+        esp_rom_delay_us(10);
     }
     int64_t end_time = esp_timer_get_time();
     int64_t duration = end_time - start_time;

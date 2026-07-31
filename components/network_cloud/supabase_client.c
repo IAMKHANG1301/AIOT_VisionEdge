@@ -190,7 +190,7 @@ esp_err_t supabase_get_pending_command(char* out_id, size_t id_len, char* out_cm
         .url = url,
         .method = HTTP_METHOD_GET,
         .timeout_ms = 5000,
-        .buffer_size = 2048,
+        .buffer_size = 8192,
         .event_handler = supabase_get_http_event_handler,
         .crt_bundle_attach = esp_crt_bundle_attach
     };
@@ -249,7 +249,7 @@ esp_err_t supabase_update_command_status(const char* id, const char* status) {
         .url = url,
         .method = HTTP_METHOD_PATCH,
         .timeout_ms = 5000,
-        .buffer_size = 2048,
+        .buffer_size = 8192,
         .event_handler = supabase_get_http_event_handler,
         .crt_bundle_attach = esp_crt_bundle_attach
     };

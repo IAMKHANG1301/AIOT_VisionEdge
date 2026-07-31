@@ -83,12 +83,9 @@ const char* index_html = R"=====(
             fetch(aiEnabled ? '/ai_on' : '/ai_off')
                 .then(() => {
                     if (aiEnabled) {
-                        document.getElementById('stream').src = '/live_frame.jpg?t=' + Date.now();
-                        streamInterval = setInterval(() => {
-                            document.getElementById('stream').src = '/live_frame.jpg?t=' + Date.now();
-                        }, 1000);
+                        document.getElementById('stream').src = 'http://' + window.location.hostname + ':81/stream';
+                        // No need for setInterval anymore, MJPEG pushes automatically
                     } else {
-                        clearInterval(streamInterval);
                         document.getElementById('stream').src = '';
                         document.getElementById('stream').alt = 'Camera Stream (AI is OFF)';
                         document.getElementById('ai-status').innerText = 'AI IS OFF';

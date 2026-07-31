@@ -21,6 +21,7 @@
 
 extern "C" {
 #include "supabase_client.h"
+}
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat"
@@ -805,6 +806,70 @@ static esp_err_t snapshot_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+static esp_err_t mjpeg_stream_handler(httpd_req_t *req) {
+    esp_err_t res = ESP_OK;
+    size_t _jpg_buf_len = 0;
+    uint8_t * _jpg_buf = NULL;
+    char part_buf[64];
+    
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+    if (res != ESP_OK) return res;
+
+    size_t buf_len = 320 * 240 * 3;
+    uint8_t *tmp_buf = (uint8_t *)malloc(buf_len);
+    if (!tmp_buf) {
+        ESP_LOGE(TAG, "Out of memory for MJPEG stream");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "MJPEG Stream Started");
+
+    while (true) {
+        if (!s_ai_enabled || ai_rgb888_buf == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(500)); // Delay if AI off
+            continue;
+        }
+
+        // Copy and Swap BGR to RGB
+        for (size_t i = 0; i < buf_len; i += 3) {
+            tmp_buf[i]     = ai_rgb888_buf[i + 2];
+            tmp_buf[i + 1] = ai_rgb888_buf[i + 1];
+            tmp_buf[i + 2] = ai_rgb888_buf[i];
+        }
+
+        // Compress to JPEG (Quality 40 to save bandwidth and CPU)
+        if (fmt2jpg(tmp_buf, buf_len, 320, 240, PIXFORMAT_RGB888, 40, &_jpg_buf, &_jpg_buf_len)) {
+            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+            if (res == ESP_OK) {
+                size_t hlen = snprintf(part_buf, 64, _STREAM_PART, _jpg_buf_len);
+                res = httpd_resp_send_chunk(req, part_buf, hlen);
+            }
+            if (res == ESP_OK) {
+                res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+            }
+            free(_jpg_buf);
+            _jpg_buf = NULL;
+        }
+        
+        if (res != ESP_OK) {
+            ESP_LOGI(TAG, "MJPEG Stream Stopped/Disconnected");
+            break;
+        }
+        
+        // Cố gắng đạt 15-20fps (nghỉ 30ms + thời gian nén ảnh)
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    
+    free(tmp_buf);
+    return res;
+}
+
 static esp_err_t live_frame_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     
@@ -1194,6 +1259,24 @@ void vision_start_web_server(void) {
         ESP_LOGI(TAG, "Web Server started on port 80.");
     } else {
         ESP_LOGE(TAG, "Web Server FAILED to start!");
+    }
+
+    // Start a dedicated Stream HTTP Server on Port 81 so it doesn't block Port 80
+    httpd_config_t stream_cfg = HTTPD_DEFAULT_CONFIG();
+    stream_cfg.server_port = 81;
+    stream_cfg.ctrl_port = 32769;
+    stream_cfg.max_uri_handlers = 2;
+    
+    httpd_uri_t stream_uri = {
+        .uri       = "/stream",
+        .method    = HTTP_GET,
+        .handler   = mjpeg_stream_handler,
+        .user_ctx  = NULL
+    };
+    
+    if (httpd_start(&stream_httpd, &stream_cfg) == ESP_OK) {
+        httpd_register_uri_handler(stream_httpd, &stream_uri);
+        ESP_LOGI(TAG, "MJPEG Stream Server started on port 81.");
     }
 }
 
