@@ -1,4 +1,6 @@
 #include "hardware.h"
+#include "tft_driver.h"
+#include "board_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -7,7 +9,8 @@
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
-
+#include "driver/uart.h"
+#include <string.h>
 // For TFT SPI standard interface
 #include "driver/spi_master.h"
 
@@ -42,6 +45,7 @@ void hardware_init(void) {
     gpio_set_level(RELAY_PIN, 1); // Open-Drain: 1 = Float (High-Z) -> Relay OFF
 
     // 2. Config Buzzer
+    io_conf.mode = GPIO_MODE_OUTPUT; // Phải set lại thành PUSH-PULL vì ở trên đang là OPEN-DRAIN
     io_conf.pin_bit_mask = (1ULL << BUZZER_PIN);
     gpio_config(&io_conf);
     gpio_set_level(BUZZER_PIN, 0); // Default OFF
@@ -102,18 +106,25 @@ void hardware_init(void) {
 #endif
 
 #if defined(TFT_SPI_MOSI) && TFT_SPI_MOSI >= 0
-    // 6. TFT Display ST7789 Initial setup
-    gpio_reset_pin(TFT_SPI_MOSI); // 42 is JTAG MTMS
-    gpio_reset_pin(TFT_SPI_SCLK);
-    gpio_reset_pin(TFT_DC_PIN);
-#if TFT_RST_PIN >= 0
-    gpio_reset_pin(TFT_RST_PIN);
-#endif
-    ESP_LOGI(TAG, "TFT ST7789 SPI interface configured on MOSI:%d, SCLK:%d, CS:%d, DC:%d, RST:%d", 
-             TFT_SPI_MOSI, TFT_SPI_SCLK, TFT_CS_PIN, TFT_DC_PIN, TFT_RST_PIN);
+    // tft_lcd_init(); // TẠM THỜI VÔ HIỆU HÓA MÀN HÌNH ĐỂ TRẢ LẠI RAM
 #else
     ESP_LOGI(TAG, "TFT ST7789 not configured");
 #endif
+
+    // 6. Config UART for Inter-board communication
+    uart_config_t uart_cfg = {
+        .baud_rate  = 115200,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_driver_install(UART_NUM_1, 1024 * 2, 0, 0, NULL, 0);
+    uart_param_config(UART_NUM_1, &uart_cfg);
+    // Sử dụng GPIO 1 làm TX (Main TX -> Peripheral RX), GPIO 48 làm RX (Main RX <- Peripheral TX)
+    uart_set_pin(UART_NUM_1, GPIO_NUM_1, GPIO_NUM_48, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    ESP_LOGI(TAG, "UART inter-board init: TX=GPIO1, RX=GPIO48, baud=115200");
 }
 
 void open_door(void) {
@@ -179,11 +190,11 @@ uint32_t get_sonar_distance_cm(void) {
     esp_rom_delay_us(10);
     gpio_set_level(SONAR_TRIG_PIN, 0);
 
-    // 2. Wait for Echo to go HIGH (timeout 2ms)
-    int64_t deadline = esp_timer_get_time() + 2000LL; // 2ms
+    // 2. Wait for Echo to go HIGH (timeout 50ms for slow clones)
+    int64_t deadline = esp_timer_get_time() + 50000LL; // 50ms
     while (gpio_get_level(SONAR_ECHO_PIN) == 0) {
         if (esp_timer_get_time() > deadline) {
-            ESP_LOGW(TAG, "Sonar Timeout: Echo pin never went HIGH.");
+            // ESP_LOGW(TAG, "Sonar Timeout: Echo pin never went HIGH.");
             return 998;
         }
         esp_rom_delay_us(10);
@@ -194,7 +205,7 @@ uint32_t get_sonar_distance_cm(void) {
     deadline = start_time + 6000LL; // 6ms timeout (~100cm max range)
     while (gpio_get_level(SONAR_ECHO_PIN) == 1) {
         if (esp_timer_get_time() > deadline) {
-            ESP_LOGW(TAG, "Sonar Timeout: Echo pin never went LOW. Out of range or no obstacle.");
+            // ESP_LOGW(TAG, "Sonar Timeout: Echo pin never went LOW. Out of range or no obstacle.");
             return 999;
         }
         esp_rom_delay_us(10);
@@ -209,8 +220,26 @@ uint32_t get_sonar_distance_cm(void) {
 
 bool is_person_near(void) {
     uint32_t distance = get_sonar_distance_cm();
-    ESP_LOGD(TAG, "Sonar distance: %u cm", (unsigned int)distance);
-    return (distance < SONAR_THRESHOLD_CM);
+    
+    static int consecutive_near = 0;
+    static int consecutive_far = 0;
+    static bool current_state = false;
+
+    if (distance < SONAR_THRESHOLD_CM) {
+        consecutive_near++;
+        consecutive_far = 0;
+        if (consecutive_near > 2) {
+            current_state = true;
+        }
+    } else {
+        consecutive_far++;
+        consecutive_near = 0;
+        if (consecutive_far > 3) {
+            current_state = false;
+        }
+    }
+    
+    return current_state;
 }
 
 char read_keypad(void) {
@@ -243,10 +272,17 @@ char read_keypad(void) {
 
 void tft_display_status(const char* status) {
     ESP_LOGI(TAG, "TFT Display Status: >>> %s <<<", status);
-    /*
-     * Under the hood, this will draw the status string on the ST7789 panel:
-     * - esp_lcd_panel_draw_bitmap() or graphics library (like LVGL) to update UI.
-     */
+    
+    // Gửi lệnh sang mạch phụ qua UART
+    char json_buf[128];
+    // Tuỳ chọn màu sắc cơ bản (mở rộng thêm nếu cần)
+    const char* color = "white";
+    if (strstr(status, "DOOR OPENING")) color = "green";
+    else if (strstr(status, "ALARM")) color = "red";
+    
+    snprintf(json_buf, sizeof(json_buf), "{\"cmd\":\"display\",\"line1\":\"%s\",\"line2\":\"\",\"color\":\"%s\"}\n", status, color);
+    ESP_LOGI(TAG, "UART TX to Peripheral: %s", json_buf);
+    uart_write_bytes(UART_NUM_1, json_buf, strlen(json_buf));
 }
 
 bool sd_card_init(void) {

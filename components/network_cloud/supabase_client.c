@@ -35,7 +35,7 @@ esp_err_t supabase_upload_image(const char* bucket, const char* filename, const 
     esp_http_client_config_t config = {
         .url = url,
         .method = HTTP_METHOD_POST,
-        .timeout_ms = 10000,
+        .timeout_ms = 30000,
         .buffer_size = 8192,
         .buffer_size_tx = 4096,
         .event_handler = supabase_http_event_handler,
@@ -82,6 +82,7 @@ static esp_err_t supabase_post_json(const char* table, const char* json_data) {
         .method = HTTP_METHOD_POST,
         .timeout_ms = 5000,
         .buffer_size = 8192,
+        .buffer_size_tx = 2048,
         .crt_bundle_attach = esp_crt_bundle_attach
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -93,7 +94,8 @@ static esp_err_t supabase_post_json(const char* table, const char* json_data) {
     esp_http_client_set_header(client, "apikey", SUPABASE_ANON_KEY);
     esp_http_client_set_header(client, "Authorization", auth_header);
     esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "Prefer", "return=minimal");
+    // Use upsert to avoid 409 Conflict when web app already created the row
+    esp_http_client_set_header(client, "Prefer", "return=minimal, resolution=merge-duplicates");
     
     esp_http_client_set_post_field(client, json_data, strlen(json_data));
     
@@ -132,7 +134,7 @@ esp_err_t supabase_insert_nhatkyravao(const char* eventtype, const char* personi
 
 esp_err_t supabase_delete_nguoiquen(const char* person_id) {
     char url[256];
-    snprintf(url, sizeof(url), "%s/rest/v1/nguoiquen?personid=eq.%s", SUPABASE_URL, person_id);
+    snprintf(url, sizeof(url), "%s/rest/v1/nguoiquen?id=eq.%s", SUPABASE_URL, person_id);
     
     esp_http_client_config_t config = {
         .url = url,

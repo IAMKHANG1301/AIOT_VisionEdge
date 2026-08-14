@@ -4,7 +4,7 @@
 #include "driver/gpio.h"
 
 // Define GPIOs based on user's exact wiring
-#define RELAY_PIN       GPIO_NUM_47  // Changed from 19 (USB D-) to avoid conflict with PC
+#define RELAY_PIN       ((gpio_num_t)47)
 #define BUZZER_PIN      GPIO_NUM_2
 
 // Sonar (HC-SR04)
@@ -46,7 +46,7 @@
 // Micro INMP441 (I2S RX)
 #define I2S_MIC_SCK_PIN   GPIO_NUM_3
 #define I2S_MIC_WS_PIN    GPIO_NUM_14
-#define I2S_MIC_SD_PIN    GPIO_NUM_48
+#define I2S_MIC_SD_PIN    ((gpio_num_t)48)
 
 // Speaker MAX98357A (I2S TX)
 #define I2S_SPK_BCLK_PIN  GPIO_NUM_3

@@ -40,7 +40,7 @@ void network_send_access_log(const char *id, const char *status);
  * @param filepath Path to the image file (e.g. /sdcard/snapshot.jpg)
  * @return esp_err_t ESP_OK on success
  */
-esp_err_t upload_image_to_hf(const char* filepath);
+esp_err_t upload_image_to_hf(const char* filepath, const char* event_type);
 
 /**
  * @brief Upload an audio file to Hugging Face
@@ -72,6 +72,8 @@ void hf_ws_send_text(void *client_handle, const char *text);
 bool network_hf_process_audio(const uint8_t *audio_in, size_t in_len, 
                               char *out_guest_text, size_t max_text_len,
                               uint8_t *audio_out, size_t *out_len, size_t max_out_len);
+
+esp_err_t network_upload_audio_to_cloud(const uint8_t *pcm_buf, size_t pcm_size);
 
 #ifdef __cplusplus
 }

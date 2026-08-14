@@ -12,6 +12,7 @@
 #include "freertos/task.h"
 #include "network.h"
 #include "esp_websocket_client.h"
+#include "freertos/ringbuf.h"
 #include <math.h>
 #include <string.h>
 #include "hardware.h"
@@ -25,6 +26,10 @@ static i2s_chan_handle_t s_rx_chan = NULL;   // Microphone (INMP441)
 static bool              s_initialized = false;
 
 volatile uint32_t g_last_play_time_ms = 0;
+volatile bool g_is_audio_playing = false;
+// Cờ toàn cục: ESP32 đang chờ AI trả lời (không được fire stop_audio nữa)
+volatile bool g_is_waiting_for_ai = false;
+static RingbufHandle_t s_audio_ringbuf = NULL;
 
 // =============================================================================
 // audio_init — Initialize I2S Full-Duplex Bus
@@ -53,9 +58,9 @@ void audio_init(void) {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(AUDIO_I2S_NUM, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;  // Zero-fill TX buffer when idle (prevents noise)
     
-    // Giảm bộ đệm DMA để nhường RAM cho mbedTLS (chứng chỉ HTTPS/WSS rất tốn RAM)
-    chan_cfg.dma_desc_num = 4;     // Dùng 4 khối DMA
-    chan_cfg.dma_frame_num = 256;  // Mỗi khối chứa 256 frames
+    // Tăng bộ đệm DMA để tránh khựng do thiếu hụt sample tạm thời
+    chan_cfg.dma_desc_num = 6;     // Dùng 6 khối DMA
+    chan_cfg.dma_frame_num = 512;  // Mỗi khối chứa 512 frames (Tổng = 24KB SRAM, ~192ms audio buffer)
 
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx_chan, &s_rx_chan);
     if (err != ESP_OK) {
@@ -112,6 +117,17 @@ void audio_init(void) {
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));
     ESP_ERROR_CHECK(i2s_channel_enable(s_rx_chan));
 
+    // Khởi động 400KB RingBuffer trên PSRAM
+    s_audio_ringbuf = xRingbufferCreate(400 * 1024, RINGBUF_TYPE_BYTEBUF);
+    if (!s_audio_ringbuf) {
+        ESP_LOGE(TAG, "Failed to create 400KB RingBuffer in PSRAM!");
+    } else {
+        extern void audio_play_task_func(void *arg);
+        // Chạy trên Core 1 để không tranh CPU với WiFi/WebSocket (Core 0)
+        // Giải quyết vấn đề âm thanh bị khựng do Core 0 bị quá tải
+        xTaskCreatePinnedToCore(audio_play_task_func, "audio_play_task", 4096, NULL, 6, NULL, 1);
+    }
+
     s_initialized = true;
     ESP_LOGI(TAG, "Audio I2S initialized OK ✓  (16kHz, 32-bit slot, Stereo Mode)");
     return;
@@ -153,60 +169,33 @@ int audio_record(uint8_t *buffer, int max_len) {
     int16_t  *out               = (int16_t *)buffer;
     int       max_samples_16bit = max_len / sizeof(int16_t);
 
+    // Configure boot button as input
+    gpio_reset_pin(GPIO_NUM_0);
+    gpio_set_direction(GPIO_NUM_0, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(GPIO_NUM_0, GPIO_PULLUP_ONLY);
+
     while (total_written < max_samples_16bit) {
         // Read 32-bit samples from INMP441 via I2S DMA
         size_t bytes_read = 0;
         esp_err_t err = i2s_channel_read(s_rx_chan, dma_buf, DMA_BUF_BYTES,
                                          &bytes_read, pdMS_TO_TICKS(100));
         if (err != ESP_OK || bytes_read == 0) continue;
-
         int samples_read = bytes_read / sizeof(int32_t);
-
-        // Calculate mean (DC offset)
-        int64_t sum = 0;
-        int valid_samples = 0;
-        for (int i = 0; i < samples_read; i += 2) {
-            int32_t sample = (dma_buf[i] >> 16) * 4;
-            if (sample > 32767) sample = 32767;
-            if (sample < -32768) sample = -32768;
-            sum += sample;
-            valid_samples++;
-        }
-        int16_t mean = (valid_samples > 0) ? (int16_t)(sum / valid_samples) : 0;
-
-        int64_t rms_sum = 0;
-        for (int i = 0; i < samples_read && total_written < max_samples_16bit; i++) {
-            if (i % 2 != 0) continue; // Skip RIGHT channel (always zero from INMP441)
-            // Shift right 16 to get 16-bit, then boost gain x4 with clamp
-            int32_t sample = (dma_buf[i] >> 16) * 4;
-            if (sample > 32767) sample = 32767;
-            if (sample < -32768) sample = -32768;
-            int16_t sample_16 = (int16_t)sample;
+        
+        // STEREO mode: xen kẽ LEFT, RIGHT. INMP441 chỉ phát trên LEFT, RIGHT = 0
+        for (int i = 0; i < samples_read && total_written < max_samples_16bit; i += 2) { // i += 2 để skip RIGHT
+            // >> 14: Giữ lại 18-bit cao, cho ra giá trị ~2x to hơn so với >>16
+            // Lấy đủ 24-bit data của INMP441
+            int32_t value = dma_buf[i] >> 14;
+            int16_t sample_16 = (value > INT16_MAX) ? INT16_MAX : (value < -INT16_MAX) ? (int16_t)-INT16_MAX : (int16_t)value;
             
             out[total_written++] = sample_16;
-            
-            // Remove DC offset for VAD RMS calculation
-            int16_t ac_sample = sample_16 - mean;
-            rms_sum += (int64_t)ac_sample * ac_sample;
         }
 
-        // --- Voice Activity Detection (VAD) ---
-        int64_t rms = (valid_samples > 0) ? (int64_t)sqrtf((float)(rms_sum / valid_samples)) : 0;
-        if (rms < VAD_SILENCE_THRESHOLD) {
-            if (!silence_started) {
-                silence_started = true;
-                silence_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            } else {
-                int64_t silence_dur = xTaskGetTickCount() * portTICK_PERIOD_MS - silence_start_ms;
-                if (silence_dur > VAD_SILENCE_TIMEOUT_MS) {
-                    ESP_LOGI(TAG, "VAD: silence detected, stopping. Recorded %d samples", total_written);
-                    break;
-                }
-            }
-        } else {
-            // Voice detected — reset silence timer
-            silence_started  = false;
-            silence_start_ms = 0;
+        // Push-to-talk: Kiểm tra nếu nhả nút BOOT thì dừng ghi âm ngay
+        if (gpio_get_level(GPIO_NUM_0) == 1) {
+            ESP_LOGI(TAG, "Nút đã nhả, kết thúc ghi âm.");
+            break;
         }
     }
 
@@ -384,7 +373,6 @@ void audio_test_record_to_sd(void) {
     size_t written = fwrite(pcm_buf, 1, bytes_recorded, f);
     fclose(f);
     free(pcm_buf);
-
     if (written == (size_t)bytes_recorded) {
         ESP_LOGI(TAG, "Saved RAW PCM file: %d bytes to %s", (int)written, filepath);
     } else {
@@ -393,132 +381,164 @@ void audio_test_record_to_sd(void) {
 }
 
 // =============================================================================
-// audio_stream_to_ws
+// audio_test_record_toggle - TEST: Toggle manual recording from mic
 // =============================================================================
-void audio_stream_to_ws(void *client_handle) {
-    esp_websocket_client_handle_t client = (esp_websocket_client_handle_t)client_handle;
-    const int CHUNK_SIZE = 4096;
-    uint8_t *pcm_chunk = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_SPIRAM);
-    if (!pcm_chunk) return;
-    
-    int silent_chunks = 15; // Đặt sẵn 15 để ban đầu coi như đang im lặng, không gửi data thừa
-    int away_chunks = 0;
-    int chunk_counter = 0;
-    
-    while (1) {
-        chunk_counter++;
-        if (chunk_counter >= 5) { // Chỉ đo khoảng cách sau mỗi 5 chunk (~640ms)
-            uint32_t dist = get_sonar_distance_cm();
-            uint32_t current_time_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            
-            // Nếu AI đang nói hoặc vừa mới nói xong (trong vòng 5 giây), KHÔNG ngắt kết nối
-            if (current_time_ms - g_last_play_time_ms < 5000) {
-                away_chunks = 0;
-            } 
-            else if (dist >= 50 || dist == 0) {
-                away_chunks++;
-                if (away_chunks > 15) { // ~10 giây liên tục không có ai và AI không nói
-                    ESP_LOGI(TAG, "Khách đã thực sự rời đi (Xa liên tục 10s), ngắt Streaming.");
-                    break;
-                }
-            } else {
-                away_chunks = 0; // Reset nếu khách lại gần
-            }
-            chunk_counter = 0;
-        }
+bool g_is_test_audio_active = false;
+static uint8_t *s_test_pcm_buf = NULL;
+static int s_test_pcm_written = 0;
+static TaskHandle_t s_test_record_task_handle = NULL;
 
+static void test_record_task(void *arg) {
+    const int MAX_RECORD_SECONDS = 10;
+    const int MAX_TEST_BUF_SIZE = AUDIO_SAMPLE_RATE * MAX_RECORD_SECONDS * sizeof(int16_t);
+
+    s_test_pcm_buf = (uint8_t *)heap_caps_malloc(MAX_TEST_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    if (!s_test_pcm_buf) s_test_pcm_buf = (uint8_t *)malloc(MAX_TEST_BUF_SIZE);
+    
+    if (!s_test_pcm_buf) {
+        ESP_LOGE(TAG, "test_record_task: malloc failed");
+        g_is_test_audio_active = false;
+        s_test_record_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "=== Manual Recording started (max %ds) ===", MAX_RECORD_SECONDS);
+
+    const int DMA_BUF_SAMPLES = 256;
+    const int DMA_BUF_BYTES   = DMA_BUF_SAMPLES * sizeof(int32_t);
+    int32_t  *dma_buf         = (int32_t *)malloc(DMA_BUF_BYTES);
+    if (!dma_buf) {
+        free(s_test_pcm_buf);
+        s_test_pcm_buf = NULL;
+        g_is_test_audio_active = false;
+        s_test_record_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    s_test_pcm_written = 0;
+    int max_samples_16bit = MAX_TEST_BUF_SIZE / sizeof(int16_t);
+    int16_t *out = (int16_t *)s_test_pcm_buf;
+
+    while (g_is_test_audio_active && s_test_pcm_written < max_samples_16bit) {
         size_t bytes_read = 0;
-        esp_err_t err = i2s_channel_read(s_rx_chan, pcm_chunk, CHUNK_SIZE, &bytes_read, portMAX_DELAY);
+        esp_err_t err = i2s_channel_read(s_rx_chan, dma_buf, DMA_BUF_BYTES, &bytes_read, pdMS_TO_TICKS(100));
+        if (err != ESP_OK || bytes_read == 0) continue;
         
-        if (err == ESP_OK && bytes_read > 0) {
-            uint32_t current_time_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (current_time_ms - g_last_play_time_ms < 1000) {
-                // Mute mic while playing to avoid echo and VAD false triggers
-                silent_chunks = 15; // Reset VAD silence counter
-                continue; // Do not process or send this audio chunk
-            }
-
-            int32_t *dma_buf = (int32_t *)pcm_chunk;
-            int samples_read = bytes_read / sizeof(int32_t);
-            
-            // Calculate mean (DC offset)
-            int64_t sum = 0;
-            int valid_samples = 0;
-            for (int i = 0; i < samples_read; i += 2) {
-                int32_t sample = (dma_buf[i] >> 16);
-                sum += sample;
-                valid_samples++;
-            }
-            int16_t mean = (valid_samples > 0) ? (int16_t)(sum / valid_samples) : 0;
-            
-            int64_t sq_sum = 0;
-            
-            // Allocate 16-bit PCM buffer
-            int16_t *pcm16 = (int16_t *)malloc(valid_samples * sizeof(int16_t));
-            if (!pcm16) {
-                static int malloc_err_counter = 0;
-                malloc_err_counter++;
-                if (malloc_err_counter % 10 == 0) {
-                    ESP_LOGE(TAG, "Lỗi hết RAM: Không thể cấp phát %d byte cho pcm16", (int)(valid_samples * sizeof(int16_t)));
-                }
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-            
-            int p_idx = 0;
-            for (int i = 0; i < samples_read; i += 2) { // Skip RIGHT channel
-                int32_t sample = (dma_buf[i] >> 16);
-                sample = (sample - mean) * 4; // GAIN x4
-                if (sample > 32767) sample = 32767;
-                if (sample < -32768) sample = -32768;
-                
-                pcm16[p_idx++] = (int16_t)sample;
-                sq_sum += (int64_t)sample * sample;
-            }
-            
-            int rms = sqrt(sq_sum / (valid_samples > 0 ? valid_samples : 1));
-            
-            // -------------------------------------------------------------
-            // VAD Logic (Mốc 1000 theo yêu cầu của user)
-            // -------------------------------------------------------------
-            if (rms < 1000) {
-                if (silent_chunks < 15) {
-                    silent_chunks++;
-                    if (silent_chunks == 15) {
-                        ESP_LOGI(TAG, "Đang im lặng (VAD), chốt câu gửi cho AI...");
-                        extern void hf_ws_send_text(void *client_handle, const char *text);
-                        hf_ws_send_text(client, "{\"action\":\"stop_audio\"}");
-                    }
-                }
-            } else {
-                if (silent_chunks >= 15) {
-                    ESP_LOGI(TAG, "🎙️ Có tiếng động (RMS: %d), bắt đầu thu...", rms);
-                }
-                silent_chunks = 0;
-            }
-            
-            // CHỈ gửi dữ liệu lên mây nếu đang trong trạng thái NÓI (silent_chunks < 15)
-            if (silent_chunks < 15) {
-                esp_websocket_client_send_bin(client, (const char*)pcm16, p_idx * sizeof(int16_t), portMAX_DELAY);
-            }
-            
-            free(pcm16);
-            
-            static int log_counter = 0;
-            log_counter++;
-            if (log_counter >= 8) { // Khoảng 1 giây 1 lần
-                ESP_LOGI(TAG, "Dữ liệu mic: RMS = %d | VAD: %s", rms, (silent_chunks < 15) ? "ĐANG THU GỬI MÂY" : "BỎ QUA");
-                log_counter = 0;
-            }
-        } else {
-            // Lỗi đọc I2S
-            static int err_counter = 0;
-            err_counter++;
-            if (err_counter % 10 == 0) {
-                ESP_LOGE(TAG, "Lỗi đọc I2S: err = %d (%s), bytes_read = %d", err, esp_err_to_name(err), (int)bytes_read);
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
+        int samples_read = bytes_read / sizeof(int32_t);
+        for (int i = 0; i < samples_read && s_test_pcm_written < max_samples_16bit; i += 2) {
+            int32_t value = dma_buf[i] >> 14;
+            out[s_test_pcm_written++] = (value > INT16_MAX) ? INT16_MAX : (value < -INT16_MAX) ? (int16_t)-INT16_MAX : (int16_t)value;
         }
     }
-    free(pcm_chunk);
+
+    free(dma_buf);
+    g_is_test_audio_active = false;
+    
+    int bytes_recorded = s_test_pcm_written * sizeof(int16_t);
+    if (bytes_recorded > 0) {
+        ESP_LOGI(TAG, "=== Uploading %d bytes to Cloud ===", bytes_recorded);
+        network_upload_audio_to_cloud(s_test_pcm_buf, bytes_recorded);
+    } else {
+        ESP_LOGW(TAG, "No audio recorded to upload.");
+    }
+
+    free(s_test_pcm_buf);
+    s_test_pcm_buf = NULL;
+    ESP_LOGI(TAG, "=== TEST COMPLETE ===");
+    s_test_record_task_handle = NULL;
+    vTaskDelete(NULL);
 }
+
+void audio_test_record_toggle(void) {
+    if (!s_initialized) return;
+    
+    if (g_is_test_audio_active) {
+        ESP_LOGI(TAG, "audio_test_record_toggle: Stopping record");
+        g_is_test_audio_active = false;
+    } else {
+        ESP_LOGI(TAG, "audio_test_record_toggle: Starting record");
+        g_is_test_audio_active = true;
+        // 8192 is enough for TLS, 16384 might fail to allocate due to memory fragmentation
+        BaseType_t ret = xTaskCreate(test_record_task, "test_rec_tsk", 8192, NULL, 5, &s_test_record_task_handle);
+        if (ret != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create test_record_task (err=%d). Insufficient memory?", ret);
+            g_is_test_audio_active = false;
+        }
+    }
+}
+
+int audio_test_is_recording(void) {
+    return g_is_test_audio_active ? 1 : 0;
+}
+
+// =============================================================================
+// audio_feed_ringbuffer & audio_play_task_func
+// =============================================================================
+void audio_feed_ringbuffer(const uint8_t *data, size_t len) {
+    if (s_audio_ringbuf) {
+        xRingbufferSend(s_audio_ringbuf, (void*)data, len, pdMS_TO_TICKS(100));
+    }
+}
+
+void audio_play_task_func(void *arg) {
+    ESP_LOGI(TAG, "Audio Play Task Started (with Pre-buffering).");
+    bool prebuffering = true;
+    size_t last_used_size = 0;
+    int idle_ticks = 0;
+    
+    while (1) {
+        if (prebuffering) {
+            size_t free_size = xRingbufferGetCurFreeSize(s_audio_ringbuf);
+            size_t used_size = (400 * 1024) - free_size;
+            
+            if (used_size > 120000) { // 120KB (~3.75 giây audio) chống giật do mạng chậm
+                prebuffering = false;
+                ESP_LOGI(TAG, "Pre-buffering complete (%zu bytes). Starting playback.", used_size);
+            } else if (used_size > 2000) { // Co data trong buffer
+                if (used_size == last_used_size) {
+                    idle_ticks++;
+                    if (idle_ticks > 75) { // 1500ms khong co data moi -> chac la het file
+                        prebuffering = false;
+                        ESP_LOGI(TAG, "Pre-buffering timeout/EOF (%zu bytes). Starting playback.", used_size);
+                    }
+                } else {
+                    idle_ticks = 0;
+                }
+            } else {
+                idle_ticks = 0;
+            }
+            last_used_size = used_size;
+            
+            if (prebuffering) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+        }
+
+        size_t item_size;
+        // Kéo 16KB mỗi lần (tăng từ 4096) để giảm số lần chuyển tiếp, chống giật
+        void *item = xRingbufferReceiveUpTo(s_audio_ringbuf, &item_size, pdMS_TO_TICKS(20), 16384);
+        if (item) {
+            g_is_audio_playing = true;
+            g_last_play_time_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            audio_play_chunk((const uint8_t*)item, item_size);
+            vRingbufferReturnItem(s_audio_ringbuf, item);
+        } else {
+            g_is_audio_playing = false;
+            prebuffering = true; // Bat lai che do pre-buffering cho cau hoi tiep theo
+            idle_ticks = 0;
+        }
+    }
+}
+
+// =============================================================================
+// audio_stream_to_ws
+// [DEPRECATED] HTTP POST is now used in web_ui instead of WS continuous streaming
+// =============================================================================
+/*
+void audio_stream_to_ws(void *client_handle) {
+    // ...
+}
+*/

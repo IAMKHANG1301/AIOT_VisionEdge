@@ -119,34 +119,48 @@ static void hardware_test_task(void *arg) {
 }
 #endif
 
+// TẠM THỜI VÔ HIỆU HÓA VOICE QUERY TẠI MẠCH CHÍNH (CHUYỂN SANG MẠCH PHỤ)
 // =============================================================================
-// Voice Assistant Task (Real-Time Streaming)
-// =============================================================================
-static void voice_assistant_task(void *arg) {
-    ESP_LOGI(TAG, "Voice Assistant Task Started (Waiting for Sonar < 50cm)...");
-    vTaskDelay(pdMS_TO_TICKS(10000));
-
-    while (1) {
-        uint32_t dist = get_sonar_distance_cm();
-        if (dist > 0 && dist < 50) {
-            ESP_LOGI(TAG, "👤 Khách đến gần (%u cm)! Mở kết nối Real-time Streaming...", (unsigned)dist);
-            
-            // Mở WebSocket
-            void* client = hf_ws_connect();
-            if (client) {
-                ESP_LOGI(TAG, "🎙️ Bắt đầu truyền phát âm thanh trực tiếp (Streaming)...");
-                
-                extern void audio_stream_to_ws(void* client_handle);
-                audio_stream_to_ws(client);
-                
-                // Khi hàm trên kết thúc tức là khách đã đi xa
-                hf_ws_disconnect(client);
-            }
-            vTaskDelay(pdMS_TO_TICKS(1000)); // Cooldown 1s rồi quét lại Sonar
-        }
-        vTaskDelay(pdMS_TO_TICKS(300));
-    }
-}
+// static TaskHandle_t s_voice_task = NULL;
+// 
+// static void voice_query_task(void *arg)
+// {
+//     ESP_LOGI(TAG, "=== [BOOT] Voice Query: Bắt đầu ghi âm ===");
+// 
+//     const int buf_size = 16000 * 10 * sizeof(int16_t);
+//     uint8_t *pcm_buf = (uint8_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
+//     if (!pcm_buf) pcm_buf = (uint8_t *)malloc(buf_size);
+//     if (!pcm_buf) {
+//         ESP_LOGE(TAG, "voice_query_task: Cannot allocate record buffer!");
+//         s_voice_task = NULL;
+//         vTaskDelete(NULL);
+//         return;
+//     }
+// 
+//     int bytes_recorded = audio_record(pcm_buf, buf_size);
+// 
+//     if (bytes_recorded <= 0) {
+//         ESP_LOGW(TAG, "Ghi âm thất bại hoặc trống.");
+//         free(pcm_buf);
+//         s_voice_task = NULL;
+//         vTaskDelete(NULL);
+//         return;
+//     }
+// 
+//     ESP_LOGI(TAG, "Ghi âm xong: %d bytes. Đang gửi lên Cloud...", bytes_recorded);
+// 
+//     esp_err_t ret = network_upload_audio_to_cloud(pcm_buf, (size_t)bytes_recorded);
+// 
+//     if (ret == ESP_OK) {
+//         ESP_LOGI(TAG, "Cloud xử lý thành công.");
+//     } else {
+//         ESP_LOGE(TAG, "Gửi Cloud thất bại.");
+//     }
+// 
+//     free(pcm_buf);
+//     s_voice_task = NULL;
+//     vTaskDelete(NULL);
+// }
 
 // =============================================================================
 // app_main — Application Entry Point
@@ -165,10 +179,10 @@ extern "C" void app_main(void) {
     // Register MQTT Callbacks
     mqtt_set_open_door_cb([]() {
         open_door();
-        // Báo MQTT mở cửa
         char mqtt_payload[128];
         snprintf(mqtt_payload, sizeof(mqtt_payload), "{\"action\":\"open_door\",\"status\":\"success\",\"message\":\"Cửa đã mở thành công\"}");
         mqtt_publish_status(mqtt_payload);
+        ESP_LOGI(TAG, "Mở cửa qua MQTT thành công.");
     });
     mqtt_set_delete_face_cb([](const char* id) {
         vision_delete_enrolled_face(id);
@@ -184,7 +198,8 @@ extern "C" void app_main(void) {
     }
 
     // 4. Audio I2S — initialize INMP441 + MAX98357A full-duplex
-    audio_init();
+    // Tạm vô hiệu hóa Audio trên mạch chính để trả lại GPIO 1 và GPIO 48 cho UART
+    // audio_init();
 
     // 5. Vision — initialize OV2640 camera + AI models + HTTP Web UI
     if (vision_init()) {
@@ -194,19 +209,36 @@ extern "C" void app_main(void) {
         ESP_LOGE(TAG, "Vision init FAILED — camera may not be connected via FPC.");
     }
 
-    // 6. Launch Voice Assistant Task on Core 0 (Handles Sonar trigger & Mic VAD)
-    xTaskCreatePinnedToCore(
-        voice_assistant_task,
-        "voice_assist",
-        8192,   // Stack: 8KB
-        NULL,
-        4,      // Priority: 4
-        NULL,
-        0       // Core 0 (WiFi + audio tasks)
-    );
+    // 6. UART liên mạch
+    // Mạch Chính TX: GPIO 1  → Mạch Phụ RX: GPIO 35
+    // Mạch Chính RX: GPIO 48 ← Mạch Phụ TX: GPIO 36
+    // (Bỏ qua cấu hình UART nếu bạn muốn test độc lập nút bấm trên mạch chính trước)
+    
+    // Nút BOOT (GPIO_NUM_0)
+    gpio_reset_pin(GPIO_NUM_0);
+    gpio_set_direction(GPIO_NUM_0, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(GPIO_NUM_0, GPIO_PULLUP_ONLY);
+    int last_button_state = 1;
 
-    // Main loop — keeps watchdog happy while Web Server and AI tasks run
+    // Vòng lặp chính — quét nút BOOT để ghi âm Push-To-Talk (VÔ HIỆU HÓA TRÊN MẠCH CHÍNH)
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        /*
+        int current_state = gpio_get_level(GPIO_NUM_0);
+        if (current_state == 0 && last_button_state == 1) {
+            vTaskDelay(pdMS_TO_TICKS(50)); // debounce
+            if (gpio_get_level(GPIO_NUM_0) == 0) {
+                if (s_voice_task == NULL) {
+                    xTaskCreate(voice_query_task, "voice_query", 8192, NULL, 5, &s_voice_task);
+                } else {
+                    ESP_LOGI(TAG, "Đang xử lý, vui lòng đợi...");
+                }
+                while(gpio_get_level(GPIO_NUM_0) == 0) { 
+                    vTaskDelay(pdMS_TO_TICKS(10)); 
+                }
+            }
+        }
+        last_button_state = current_state;
+        */
+        vTaskDelay(pdMS_TO_TICKS(100)); // Nhường CPU
     }
 }

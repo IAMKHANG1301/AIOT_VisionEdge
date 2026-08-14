@@ -8,10 +8,12 @@ extern "C" {
 #endif
 
 typedef void (*mqtt_open_door_cb_t)(void);
+typedef void (*mqtt_take_snapshot_cb_t)(void);
 typedef void (*mqtt_delete_face_cb_t)(const char* id);
 typedef void (*mqtt_enroll_face_cb_t)(const char* name);
 
 void mqtt_set_open_door_cb(mqtt_open_door_cb_t cb);
+void mqtt_set_take_snapshot_cb(mqtt_take_snapshot_cb_t cb);
 void mqtt_set_delete_face_cb(mqtt_delete_face_cb_t cb);
 void mqtt_set_enroll_face_cb(mqtt_enroll_face_cb_t cb);
 

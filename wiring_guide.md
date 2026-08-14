@@ -1,6 +1,6 @@
-# AIoT Receptionist - Hướng dẫn Đấu Nối Phần Cứng (Wiring Guide)
+# Hướng dẫn Đấu Nối Phần Cứng (Wiring Guide) - Toàn Hệ Thống
 
-Tài liệu này hướng dẫn cách đấu nối toàn bộ hệ thống phần cứng cho dự án AIoT Receptionist, đặc biệt nhấn mạnh phần nguồn điện và hệ thống Khóa điện từ (Solenoid) qua Rơ-le (Relay) để đảm bảo an toàn, không cháy mạch.
+Tài liệu này hướng dẫn cách đấu nối toàn bộ hệ thống phần cứng cho dự án AIoT (bao gồm Mạch Chính và Mạch Phụ), đặc biệt nhấn mạnh phần giao tiếp liên mạch.
 
 ---
 
@@ -9,79 +9,80 @@ Tài liệu này hướng dẫn cách đấu nối toàn bộ hệ thống phầ
 Hệ thống sử dụng Adapter 12V làm nguồn chính để có đủ lực kéo Solenoid, sau đó dùng mạch hạ áp DC-DC để nuôi ESP32 và cảm biến.
 
 *   **Adapter 12V (Nguồn tổ ong / Adapter DC):**
-    *   **Dây Dương (+12V):** Nối làm 2 nhánh.
-        *   Nhánh 1: Nối vào đầu vào (IN+) của mạch hạ áp DC-DC.
-        *   Nhánh 2: Nối trực tiếp vào chân **COM** của Relay.
-    *   **Dây Âm (GND):** Nối làm 2 nhánh.
-        *   Nhánh 1: Nối vào đầu vào (IN-) của mạch hạ áp DC-DC.
-        *   Nhánh 2: Nối thẳng vào 1 trong 2 dây của cục Solenoid.
-
+    *   **Dây Dương (+12V):** Nối làm 2 nhánh. Nhánh 1 vào (IN+) mạch hạ áp DC-DC. Nhánh 2 vào chân **COM** của Relay.
+    *   **Dây Âm (GND):** Nối làm 2 nhánh. Nhánh 1 vào (IN-) mạch hạ áp DC-DC. Nhánh 2 vào 1 trong 2 dây của cục Solenoid.
 *   **Mạch Hạ Áp (DC-DC Buck Converter):**
-    *   **IN+ / IN-:** Nhận nguồn 12V từ Adapter.
-    *   **Biến trở (Chiết áp):** Dùng tua-vít vặn để đo đồng hồ vạn năng sao cho đầu ra đạt **chính xác 5.0V đến 5.2V** (Tuyệt đối không vượt quá 5.5V kẻo cháy ESP32).
-    *   **OUT+ (5V):** Nối vào chân **5V (hoặc VIN/VBUS)** của ESP32 và chân **VCC** của mạch Relay.
-    *   **OUT- (GND):** Nối vào chân **GND** của ESP32 và chân **GND** của mạch Relay.
+    *   **Biến trở (Chiết áp):** Dùng tua-vít vặn để đầu ra đạt **chính xác 5.0V đến 5.2V** (Tuyệt đối không vượt quá 5.5V kẻo cháy ESP32).
+    *   **OUT+ (5V):** Nối vào chân **5V (hoặc VIN/VBUS)** của ESP32 (cả 2 mạch nếu dùng chung 1 nguồn, hoặc 2 nguồn riêng) và chân **VCC** của mạch Relay.
+    *   **OUT- (GND):** Nối vào chân **GND** của ESP32 (RẤT QUAN TRỌNG: **GND của Mạch Chính và Mạch Phụ phải được nối chung với nhau**).
 
 ---
 
-## 2. Hệ thống Khóa Điện Từ (Solenoid) & Relay
+## 2. Giao Tiếp Liên Mạch (UART)
 
-Mạch ESP32 xuất tín hiệu 3.3V, nhưng Relay lại chạy 5V và là loại **Active LOW**. Do đó chúng ta cấu hình chân GPIO của ESP32 ở chế độ **Open-Drain (Máng hở)**.
+Giao tiếp giữa Mạch Chính và Mạch Phụ để truyền tín hiệu hiển thị màn hình và kết quả xử lý.
 
-*   **Đấu nối Mạch Relay 5V (1 Kênh):**
-    *   **VCC:** Nối vào đường nguồn 5V (từ mạch DC-DC).
-    *   **GND:** Nối vào đường GND chung.
-    *   **IN (Tín hiệu):** Nối vào **GPIO 47** của ESP32. *(Lưu ý: Không dùng GPIO 19 vì đó là chân USB D- của ESP32-S3, khi cắm cáp USB máy tính sẽ gây xung đột làm Rơ-le bị liệt).*
+| Chức năng | MẠCH CHÍNH (Receptionist) | MẠCH PHỤ (Peripheral) |
+| :--- | :--- | :--- |
+| **GND Chung** | Chân GND | Chân GND |
+| **Đường truyền (TX -> RX)**| **GPIO 1** (TX) | **GPIO 18** (RX) |
+| **Đường nhận (RX <- TX)** | **GPIO 48** (RX) | **GPIO 17** (TX) |
 
-*   **Đầu ra Rơ-le (Đóng cắt 12V) & Solenoid:**
-    *   Trên cục Relay có 3 lỗ vặn ốc (NC, COM, NO).
-    *   **COM (Ở giữa):** Cấp nguồn **+12V** chờ sẵn.
-    *   **NO (Normally Open - Thường Mở):** Nối vào sợi dây còn lại của Solenoid. *(Tuyệt đối không nối vào lỗ NC, nếu không chốt sẽ liên tục thục vào và ngâm điện 12V gây nóng/cháy).*
-    *   **Nguyên lý hoạt động:** Bình thường, COM và NO bị ngắt, Solenoid mất điện nảy ra (Khóa). Khi ESP32 kéo GPIO 47 xuống 0V, Relay kêu "Tạch", nối COM sang NO, dòng 12V chạy qua Solenoid làm chốt thụt vào (Mở cửa) trong đúng 5 giây rồi ngắt.
+*(Lưu ý: Chân TX của mạch này phải cắm vào chân RX của mạch kia).*
 
 ---
 
-## 3. Các Cảm Biến & Thiết bị Ngoại Vi Khác (ESP32-S3)
+## 3. Cấu hình Chân - MẠCH CHÍNH (AIoT Receptionist)
 
-### Cảm Biến Siêu Âm (HC-SR04) - Hoạt động ở mức 5V
-*   **VCC:** Nối 5V
-*   **GND:** Nối GND
-*   **Trig:** GPIO 21
-*   **Echo:** GPIO 41
+*Tính năng Âm thanh (Mic/Loa) và Màn hình TFT đã được vô hiệu hóa trên mạch này để nhường tài nguyên và nhường chân cho UART.*
+
+### Khóa Điện Từ (Solenoid) & Relay 5V (Active LOW)
+*   **VCC:** 5V (Từ mạch DC-DC)
+*   **GND:** GND
+*   **IN (Tín hiệu):** **GPIO 47**
+*   *(Tiếp điểm Relay: COM nối +12V, NO nối Solenoid).*
+
+### Cảm Biến Siêu Âm (HC-SR04)
+*   **VCC / GND:** 5V / GND
+*   **Trig:** **GPIO 21**
+*   **Echo:** **GPIO 41**
 
 ### Loa Còi (Buzzer)
-*   **Chân Dương (+):** Nối GPIO 2
-*   **Chân Âm (-):** Nối GND
-
-### Màn hình TFT (ST7789 SPI)
-*   **SDA (MOSI):** GPIO 42
-*   **SCL (SCLK):** GPIO 45
-*   **DC:** GPIO 46
-*   *(Các chân RST, CS không dùng hoặc nối cứng theo board)*
-
-### Giao tiếp Âm thanh (I2S - INMP441 & MAX98357A)
-*   **SCK / BCLK:** GPIO 3 (Dùng chung cho cả Mic và Loa)
-*   **WS / LRC:** GPIO 14 (Dùng chung)
-*   **SD (Mic OUT):** GPIO 48
-*   **DIN (Spk IN):** GPIO 1
+*   **Chân Dương (+):** **GPIO 2**
+*   **Chân Âm (-):** GND
 
 ### Khe cắm Thẻ nhớ (SD Card - SDMMC 1-Bit)
-*   **CMD:** GPIO 38
-*   **CLK:** GPIO 39
-*   **D0:** GPIO 40
+*   **CMD:** **GPIO 38**
+*   **CLK:** **GPIO 39**
+*   **D0:** **GPIO 40**
 
 ### Camera (OV2640)
-*   **XCLK:** GPIO 15
-*   **PCLK:** GPIO 13
-*   **VSYNC:** GPIO 6
-*   **HREF:** GPIO 7
-*   **SDA (SIOD):** GPIO 4
-*   **SCL (SIOC):** GPIO 5
-*   **Y9 (D7):** GPIO 16
-*   **Y8 (D6):** GPIO 17
-*   **Y7 (D5):** GPIO 18
-*   **Y6 (D4):** GPIO 12
-*   **Y5 (D3):** GPIO 10
-*   **Y4 (D2):** GPIO 8
-*   **Y3 (D1):** GPIO 9
-*   **Y2 (D0):** GPIO 11
+*   **XCLK:** GPIO 15 | **PCLK:** GPIO 13 | **VSYNC:** GPIO 6 | **HREF:** GPIO 7
+*   **SDA (SIOD):** GPIO 4 | **SCL (SIOC):** GPIO 5
+*   **Y9 (D7):** GPIO 16 | **Y8 (D6):** GPIO 17 | **Y7 (D5):** GPIO 18 | **Y6 (D4):** GPIO 12
+*   **Y5 (D3):** GPIO 10 | **Y4 (D2):** GPIO 8 | **Y3 (D1):** GPIO 9 | **Y2 (D0):** GPIO 11
+
+---
+
+## 4. Cấu hình Chân - MẠCH PHỤ (AIoT Peripheral)
+
+Mạch phụ đảm nhận chức năng giao tiếp giọng nói (Gemini) và hiển thị giao diện người dùng.
+
+### Nút Nhấn (Voice Query Trigger)
+*   **Nút vật lý:** Nút **BOOT** (GPIO 0) có sẵn trên board mạch. (Hoặc nối một nút bấm ngoài giữa **GPIO 0** và **GND**).
+
+### Màn hình TFT (ST7789 SPI 240x320)
+*   **VCC / GND:** 3.3V / GND
+*   **SDA (MOSI):** **GPIO 42**
+*   **SCL (SCLK):** **GPIO 45**
+*   **DC:** **GPIO 46**
+*   *(RST và CS nối theo mặc định hoặc không dùng).*
+
+### Giao tiếp Âm thanh (I2S - INMP441 Mic & MAX98357A Loa)
+Hai module này dùng chung bus I2S.
+*   **VCC / GND:** 3.3V hoặc 5V / GND
+*   **SCK (Mic) / BCLK (Loa):** **GPIO 3**
+*   **WS (Mic) / LRC (Loa):** **GPIO 14**
+*   **SD (Mic OUT - Dữ liệu Mic):** **GPIO 48**
+*   **DIN (Spk IN - Dữ liệu Loa):** **GPIO 1**
+*   *(L/R trên Mic nối GND. Kênh âm thanh có thể tùy chỉnh nếu cần).*

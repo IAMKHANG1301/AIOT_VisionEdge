@@ -10,8 +10,10 @@
 #include "config_manager.h"
 #include <string.h>
 #include <stdio.h>
-
 #include <sys/stat.h>
+#include "esp_sntp.h"
+#include <time.h>
+#include <sys/time.h>
 #include "secrets.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
@@ -25,13 +27,58 @@
 #include "freertos/task.h"
 #include "esp_crt_bundle.h"
 #include "mbedtls/base64.h"
+#include "mdns.h"
+
+// UDP Logging
+#include "lwip/sockets.h"
+#include <stdarg.h>
+
+static int g_udp_log_sock = -1;
+static struct sockaddr_in g_udp_log_addr;
+static vprintf_like_t s_original_vprintf = NULL;
+
+#define LOG_PREFIX "[REC] " 
+
+static int udp_log_vprintf(const char *fmt, va_list args) {
+    char buf[512];
+    int len = vsnprintf(buf, sizeof(buf)-1, fmt, args);
+    if (len > 0 && g_udp_log_sock >= 0) {
+        char packet[530];
+        int plen = snprintf(packet, sizeof(packet), "%s%s", LOG_PREFIX, buf);
+        sendto(g_udp_log_sock, packet, plen, MSG_DONTWAIT, (struct sockaddr *)&g_udp_log_addr, sizeof(g_udp_log_addr));
+    }
+    if (s_original_vprintf) {
+        return s_original_vprintf(fmt, args);
+    }
+    return len;
+}
+
+static void start_udp_logging() {
+    if (g_udp_log_sock >= 0) return; // Already started
+
+    g_udp_log_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (g_udp_log_sock < 0) return;
+    
+    int flags = fcntl(g_udp_log_sock, F_GETFL, 0);
+    fcntl(g_udp_log_sock, F_SETFL, flags | O_NONBLOCK);
+
+    int opt_val = 1;
+    setsockopt(g_udp_log_sock, SOL_SOCKET, SO_BROADCAST, &opt_val, sizeof(opt_val));
+
+    g_udp_log_addr.sin_family = AF_INET;
+    g_udp_log_addr.sin_port = htons(5555);
+    g_udp_log_addr.sin_addr.s_addr = inet_addr("255.255.255.255"); // Broadcast
+    
+    s_original_vprintf = esp_log_set_vprintf(udp_log_vprintf);
+    ESP_LOGI("UDP_LOG", "Started UDP Broadcast Logging on port 5555");
+}
 
 
 static const char *TAG = "NETWORK";
 static app_config_t s_app_cfg;
 static int s_retry_num = 0;
 static volatile bool g_wifi_connected = false;
-#define MAXIMUM_RETRY 10
+#define MAXIMUM_RETRY 5
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data) {
@@ -58,12 +105,6 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "=================================================");
         ESP_LOGI(TAG, "CONNECTED! IP ADDRESS: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "=================================================");
-        
-        static bool s_mqtt_started = false;
-        if (!s_mqtt_started) {
-            mqtt_app_start();
-            s_mqtt_started = true;
-        }
     }
 }
 
@@ -102,9 +143,7 @@ void network_init(void) {
 
     wifi_config_t wifi_config = {
         .sta = {
-            .threshold.rssi = -127,
-            .scan_method = WIFI_FAST_SCAN,
-            .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
         },
     };
     strncpy((char *)wifi_config.sta.ssid, s_app_cfg.wifi_ssid, 32);
@@ -115,6 +154,44 @@ void network_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     esp_wifi_set_ps(WIFI_PS_NONE);
+
+    // Initialize Network Services outside of the Wi-Fi Event Handler
+    // to prevent stack overflow in the small sys_evt task
+    mqtt_app_start();
+
+    ESP_LOGI(TAG, "Initializing SNTP to sync time...");
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    setenv("TZ", "VST-7", 1);
+    tzset();
+
+    int retry = 0;
+    const int retry_count = 5;
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry <= retry_count) {
+        ESP_LOGI(TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+    }
+    
+    time_t now = 0;
+    struct tm timeinfo = { 0 };
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    if (timeinfo.tm_year < (2024 - 1900)) {
+        ESP_LOGW(TAG, "Time could not be synchronized.");
+    } else {
+        char strftime_buf[64];
+        strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+        ESP_LOGI(TAG, "The current date/time is: %s", strftime_buf);
+    }
+
+    if (mdns_init() == ESP_OK) {
+        mdns_hostname_set("aiot-cam");
+        mdns_instance_name_set("AIoT Receptionist Camera");
+        ESP_LOGI(TAG, "mDNS initialized. You can access UI via http://aiot-cam.local/");
+    }
+
+    start_udp_logging();
 }
 
 void network_send_discord_alert(const uint8_t *image_buffer, size_t image_len, const char *message) {
@@ -151,112 +228,26 @@ bool network_hf_process_audio(const uint8_t *audio_in, size_t in_len,
     return true;
 }
 
-
+/* =============================================================================
+ * [DEPRECATED] WebSocket Code Commented Out per User Request
+ * =============================================================================
 volatile bool g_ai_reply_complete = false;
-
-static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
-    esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
-    switch (event_id) {
-        case WEBSOCKET_EVENT_DATA:
-            if (data->op_code == 0x01 && data->data_len > 0) { // Text frame
-                ESP_LOGI(TAG, "[WS_RECV] JSON: %.*s", data->data_len, (char *)data->data_ptr);
-                if (strstr((char *)data->data_ptr, "\"action\":\"complete\"") != NULL || strstr((char *)data->data_ptr, "\"action\": \"complete\"") != NULL) {
-                    g_ai_reply_complete = true;
-                }
-            } else if ((data->op_code == 0x02 || data->op_code == 0x00) && data->data_len > 0) { // Binary or Continuation
-                // Buffer the remainder byte if length is odd to prevent byte-shifting (which causes loud static)
-                static uint8_t remainder_byte = 0;
-                static bool has_remainder = false;
-                
-                int total_len = data->data_len + (has_remainder ? 1 : 0);
-                uint8_t *aligned_buf = malloc(total_len);
-                if (aligned_buf) {
-                    int offset = 0;
-                    if (has_remainder) {
-                        aligned_buf[0] = remainder_byte;
-                        offset = 1;
-                        has_remainder = false;
-                    }
-                    memcpy(aligned_buf + offset, data->data_ptr, data->data_len);
-                    
-                    if (total_len % 2 != 0) {
-                        remainder_byte = aligned_buf[total_len - 1];
-                        has_remainder = true;
-                        total_len--; // Process only the even part
-                    }
-                    
-                    extern void audio_play_chunk(const uint8_t *data, int len);
-                    audio_play_chunk(aligned_buf, total_len);
-                    free(aligned_buf);
-                }
-            }
-            break;
-        case WEBSOCKET_EVENT_ERROR:
-            ESP_LOGE(TAG, "[WS_RECV] Error event!");
-            break;
-        default:
-            break;
-    }
-}
-
-// =============================================================================
-// Helper: Tạo WebSocket client kết nối tới HF_WS_URL
-// =============================================================================
-void* hf_ws_connect(void) {
-    esp_websocket_client_config_t ws_cfg = {
-        .uri                      = HF_WS_URL,
-        .buffer_size              = 4096,
-        .crt_bundle_attach        = esp_crt_bundle_attach,
-        .skip_cert_common_name_check = true,
-        .reconnect_timeout_ms     = 10000,
-        .network_timeout_ms       = 30000,
-    };
-    esp_websocket_client_handle_t client = esp_websocket_client_init(&ws_cfg);
-    if (!client) {
-        ESP_LOGE(TAG, "WS init failed");
-        return NULL;
-    }
-    esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, websocket_event_handler, (void *)client);
-    if (esp_websocket_client_start(client) != ESP_OK) {
-        ESP_LOGE(TAG, "WS start failed");
-        esp_websocket_client_destroy(client);
-        return NULL;
-    }
-    // Chờ kết nối tối đa 10s
-    for (int i = 0; i < 100 && !esp_websocket_client_is_connected(client); i++) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    if (!esp_websocket_client_is_connected(client)) {
-        ESP_LOGE(TAG, "WS connection timeout");
-        esp_websocket_client_stop(client);
-        esp_websocket_client_destroy(client);
-        return NULL;
-    }
-    ESP_LOGI(TAG, "WS connected to HF Space");
-    return client;
-}
-
-void hf_ws_disconnect(void *client_handle) {
-    esp_websocket_client_handle_t client = (esp_websocket_client_handle_t)client_handle;
-    vTaskDelay(pdMS_TO_TICKS(500)); // chờ server xử lý
-    esp_websocket_client_stop(client);
-    esp_websocket_client_destroy(client);
-}
-
-void hf_ws_send_text(void *client_handle, const char *text) {
-    esp_websocket_client_handle_t client = (esp_websocket_client_handle_t)client_handle;
-    esp_websocket_client_send_text(client, text, strlen(text), portMAX_DELAY);
-}
+static void websocket_event_handler(...) {}
+void* hf_ws_connect(void) {}
+void hf_ws_disconnect(void *client_handle) {}
+void hf_ws_send_text(void *client_handle, const char *text) {}
+esp_err_t upload_image_to_hf(const char* filepath) {}
+esp_err_t upload_audio_to_hf(const char* filepath) {}
+esp_err_t upload_audio_to_hf_buffer(const uint8_t *pcm_buf, size_t pcm_size) {}
+============================================================================= */
 
 // =============================================================================
 // upload_image_to_hf:
-//   Gửi ảnh JPG qua WS dưới dạng JSON:
-//   {"action":"metadata","image_b64":"<base64 string>"}
+//   Gửi ảnh JPG qua HTTP POST lên Hugging Face (Endpoint /api/upload-image)
 // =============================================================================
-esp_err_t upload_image_to_hf(const char* filepath) {
-    ESP_LOGI(TAG, "[IMG] Uploading %s to HF via WS JSON...", filepath);
+esp_err_t upload_image_to_hf(const char* filepath, const char* event_type) {
+    ESP_LOGI(TAG, "[IMG] Uploading %s to HF via HTTP POST (Event: %s)...", filepath, event_type ? event_type : "unknown");
 
-    // Đọc file vào bộ nhớ
     struct stat st;
     if (stat(filepath, &st) != 0 || st.st_size == 0) {
         ESP_LOGE(TAG, "[IMG] File not found or empty: %s", filepath);
@@ -281,205 +272,185 @@ esp_err_t upload_image_to_hf(const char* filepath) {
         return ESP_FAIL;
     }
 
-    // Base64 encode
-    size_t b64_len = 0;
-    mbedtls_base64_encode(NULL, 0, &b64_len, img_buf, img_size); // lấy kích thước cần
-    char *b64_buf = (char *)heap_caps_malloc(b64_len + 1, MALLOC_CAP_SPIRAM);
-    if (!b64_buf) b64_buf = (char *)malloc(b64_len + 1);
-    if (!b64_buf) {
-        ESP_LOGE(TAG, "[IMG] Not enough RAM for base64 buffer (%zu bytes)", b64_len);
+    if (strlen(s_app_cfg.hf_space_url) == 0 || strcmp(s_app_cfg.hf_space_url, "https://your-space-name.hf.space/api/dialogue") == 0) {
+        ESP_LOGE(TAG, "Hugging Face Space API URL not configured!");
         free(img_buf);
         return ESP_FAIL;
     }
-    mbedtls_base64_encode((unsigned char*)b64_buf, b64_len + 1, &b64_len, img_buf, img_size);
-    b64_buf[b64_len] = '\0';
+
+    char upload_url[256];
+    // Thay thế /api/dialogue hoặc /api/process-visitor thành /api/upload-image
+    // Lấy base url
+    snprintf(upload_url, sizeof(upload_url), "%s", s_app_cfg.hf_space_url);
+    char *api_ptr = strstr(upload_url, "/api/");
+    if (api_ptr) {
+        strcpy(api_ptr, "/api/upload-image");
+    }
+
+    ESP_LOGI(TAG, "[IMG] Sending HTTP POST to %s (size: %zu bytes)", upload_url, img_size);
+
+    esp_http_client_config_t config = {
+        .url = upload_url,
+        .timeout_ms = 30000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .skip_cert_common_name_check = true,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+
+    const char *boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+    char content_type[128];
+    snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
+    esp_http_client_set_header(client, "Content-Type", content_type);
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+
+    const char *header_part_fmt = 
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"type\"\r\n\r\n"
+        "%s\r\n"
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"image_file\"; filename=\"snapshot.jpg\"\r\n"
+        "Content-Type: image/jpeg\r\n\r\n";
+    char header_part[512];
+    snprintf(header_part, sizeof(header_part), header_part_fmt, boundary, event_type ? event_type : "unknown", boundary);
+
+    const char *footer_part_fmt = "\r\n--%s--\r\n";
+    char footer_part[128];
+    snprintf(footer_part, sizeof(footer_part), footer_part_fmt, boundary);
+
+    int total_len = strlen(header_part) + img_size + strlen(footer_part);
+
+    esp_err_t err = esp_http_client_open(client, total_len);
+    if (err == ESP_OK) {
+        esp_http_client_write(client, header_part, strlen(header_part));
+        esp_http_client_write(client, (const char *)img_buf, img_size);
+        esp_http_client_write(client, footer_part, strlen(footer_part));
+
+        int content_length = esp_http_client_fetch_headers(client);
+        int status_code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "HTTP POST Image Status = %d, length = %d", status_code, content_length);
+    } else {
+        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+    }
+    
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
     free(img_buf);
 
-    // Tạo JSON payload: {"action":"metadata","image_b64":"..."}
-    // Prefix + suffix: ~30 chars overhead
-    size_t json_len = b64_len + 40;
-    char *json_buf = (char *)heap_caps_malloc(json_len, MALLOC_CAP_SPIRAM);
-    if (!json_buf) json_buf = (char *)malloc(json_len);
-    if (!json_buf) {
-        ESP_LOGE(TAG, "[IMG] Not enough RAM for JSON buffer");
-        free(b64_buf);
-        return ESP_FAIL;
-    }
-    snprintf(json_buf, json_len, "{\"action\":\"metadata\",\"image_b64\":\"%s\"}", b64_buf);
-    free(b64_buf);
-
-    // Gửi qua WebSocket
-    esp_websocket_client_handle_t client = hf_ws_connect();
-    if (!client) {
-        free(json_buf);
-        return ESP_FAIL;
-    }
-
-    int result = esp_websocket_client_send_text(client, json_buf, strlen(json_buf), portMAX_DELAY);
-    free(json_buf);
-
-    if (result < 0) {
-        ESP_LOGE(TAG, "[IMG] WS send failed");
-        hf_ws_disconnect(client);
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(TAG, "[IMG] Sent %d bytes JSON to HF, waiting for response...", result);
-
-    // Gửi một chunk Audio giả (khoảng 1/4 giây im lặng) để lừa backend HF 
-    // vì backend yêu cầu bắt buộc phải có "dữ liệu âm thanh" mới xử lý.
-    size_t dummy_audio_size = 4096;
-    uint8_t *dummy_audio = (uint8_t *)calloc(1, dummy_audio_size);
-    if (dummy_audio) {
-        esp_websocket_client_send_bin(client, (const char *)dummy_audio, dummy_audio_size, portMAX_DELAY);
-        free(dummy_audio);
-        ESP_LOGI(TAG, "[IMG] Sent %zu bytes of dummy audio (silence).", dummy_audio_size);
-    }
-
-    // BẮT BUỘC: Gửi tín hiệu stop_audio để backend trên HF biết đã kết thúc phiên và bắt đầu xử lý ảnh
-    const char *stop_cmd = "{\"action\":\"stop_audio\"}";
-    esp_websocket_client_send_text(client, stop_cmd, strlen(stop_cmd), portMAX_DELAY);
-    ESP_LOGI(TAG, "[IMG] Sent stop_audio signal. Waiting 3 seconds for backend to process...");
-
-    // Chờ backend xử lý (backend thường trả về JSON hoặc Audio, nhưng ESP32 chỉ cần log hoặc upload thành công)
-    vTaskDelay(pdMS_TO_TICKS(3000));
-
-    hf_ws_disconnect(client);
-    return ESP_OK;
+    return err;
 }
 
 // =============================================================================
-// upload_audio_to_hf:
-//   1. Kết nối WS
-//   2. Gửi raw PCM bytes từ file WAV (bỏ qua 44-byte header)
-//   3. Gửi JSON {"action":"stop_audio"} để báo server xử lý
+// network_upload_audio_to_cloud:
+//   Gửi trực tiếp raw PCM buffer qua HTTP POST lên Hugging Face (Endpoint /api/process-visitor)
 // =============================================================================
-esp_err_t upload_audio_to_hf(const char* filepath) {
-    ESP_LOGI(TAG, "[AUD] Uploading %s to HF via WS raw PCM...", filepath);
+esp_err_t network_upload_audio_to_cloud(const uint8_t *pcm_buf, size_t pcm_size) {
+    if (!pcm_buf || pcm_size == 0) return ESP_FAIL;
 
-    struct stat st;
-    if (stat(filepath, &st) != 0 || st.st_size == 0) {
-        ESP_LOGE(TAG, "[AUD] File not found or empty: %s", filepath);
-        return ESP_FAIL;
-    }
-    size_t file_size = (size_t)st.st_size;
-
-    // Đọc file WAV vào bộ nhớ (bỏ qua 44-byte WAV header -> chỉ gửi PCM)
-    const size_t WAV_HEADER = 44;
-    if (file_size <= WAV_HEADER) {
-        ESP_LOGE(TAG, "[AUD] File too small to contain PCM data");
-        return ESP_FAIL;
-    }
-    size_t pcm_size = file_size - WAV_HEADER;
-
-    uint8_t *pcm_buf = (uint8_t *)heap_caps_malloc(pcm_size, MALLOC_CAP_SPIRAM);
-    if (!pcm_buf) pcm_buf = (uint8_t *)malloc(pcm_size);
-    if (!pcm_buf) {
-        ESP_LOGE(TAG, "[AUD] Not enough RAM for PCM buffer (%zu bytes)", pcm_size);
+    if (strlen(s_app_cfg.hf_space_url) == 0 || strcmp(s_app_cfg.hf_space_url, "https://your-space-name.hf.space/api/dialogue") == 0) {
+        ESP_LOGE(TAG, "Hugging Face Space API URL not configured!");
         return ESP_FAIL;
     }
 
-    FILE *f = fopen(filepath, "rb");
-    if (!f) { free(pcm_buf); return ESP_FAIL; }
-    fseek(f, WAV_HEADER, SEEK_SET); // bỏ WAV header
-    size_t read_bytes = fread(pcm_buf, 1, pcm_size, f);
-    fclose(f);
+    ESP_LOGI(TAG, "[AUD] Sending HTTP POST to %s (size: %zu bytes PCM)", s_app_cfg.hf_space_url, pcm_size);
 
-    if (read_bytes != pcm_size) {
-        ESP_LOGE(TAG, "[AUD] Read incomplete: %zu/%zu", read_bytes, pcm_size);
-        free(pcm_buf);
-        return ESP_FAIL;
-    }
-
-    // Kết nối WS
-    esp_websocket_client_handle_t client = hf_ws_connect();
+    esp_http_client_config_t config = {
+        .url = s_app_cfg.hf_space_url,
+        .timeout_ms = 60000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .skip_cert_common_name_check = true,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
-        free(pcm_buf);
+        ESP_LOGE(TAG, "Failed to init HTTP client");
         return ESP_FAIL;
     }
 
-    // Gửi raw PCM trong 1 binary message
-    ESP_LOGI(TAG, "[AUD] Sending %zu bytes of raw PCM...", pcm_size);
-    int result = esp_websocket_client_send_bin(client, (const char*)pcm_buf, pcm_size, portMAX_DELAY);
-    free(pcm_buf);
+    const char *boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+    char content_type[128];
+    snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
+    esp_http_client_set_header(client, "Content-Type", content_type);
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
 
-    if (result < 0) {
-        ESP_LOGE(TAG, "[AUD] WS send PCM failed");
-        hf_ws_disconnect(client);
-        return ESP_FAIL;
+    const char *header_part_fmt = 
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"audio_file\"; filename=\"audio.wav\"\r\n"
+        "Content-Type: audio/wav\r\n\r\n";
+    char header_part[256];
+    snprintf(header_part, sizeof(header_part), header_part_fmt, boundary);
+
+    const char *footer_part_fmt = "\r\n--%s--\r\n";
+    char footer_part[128];
+    snprintf(footer_part, sizeof(footer_part), footer_part_fmt, boundary);
+
+    // Dummy WAV header for 16kHz 16-bit Mono
+    uint8_t wav_header[44] = {
+        'R', 'I', 'F', 'F',
+        0, 0, 0, 0, 
+        'W', 'A', 'V', 'E',
+        'f', 'm', 't', ' ',
+        16, 0, 0, 0, 1, 0, 1, 0, 
+        0x80, 0x3E, 0x00, 0x00, 
+        0x00, 0x7D, 0x00, 0x00, 
+        2, 0, 16, 0, 
+        'd', 'a', 't', 'a',
+        0, 0, 0, 0 
+    };
+    uint32_t data_len = pcm_size;
+    uint32_t file_len = data_len + 36;
+    memcpy(&wav_header[4], &file_len, 4);
+    memcpy(&wav_header[40], &data_len, 4);
+
+    int total_len = strlen(header_part) + sizeof(wav_header) + pcm_size + strlen(footer_part);
+
+    esp_err_t err = esp_http_client_open(client, total_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return err;
     }
-    ESP_LOGI(TAG, "[AUD] PCM sent OK (%d bytes). Sending stop_audio signal...", result);
 
-    // BẮT BUỘC: Thêm cờ toàn cục để biết khi nào Server gửi chữ "complete"
-    extern volatile bool g_ai_reply_complete;
-    g_ai_reply_complete = false;
+    esp_http_client_write(client, header_part, strlen(header_part));
+    esp_http_client_write(client, (const char *)wav_header, sizeof(wav_header));
+    esp_http_client_write(client, (const char *)pcm_buf, pcm_size);
+    esp_http_client_write(client, footer_part, strlen(footer_part));
 
-    // Gửi tín hiệu stop
-    const char *stop_msg = "{\"action\":\"stop_audio\"}";
-    esp_websocket_client_send_text(client, stop_msg, strlen(stop_msg), pdMS_TO_TICKS(5000));
-    ESP_LOGI(TAG, "[AUD] stop_audio sent. Waiting for Server AI to process and return TTS Audio...");
+    ESP_LOGI(TAG, "[AUD] Data uploaded. Waiting for AI response...");
 
-    // Chờ server phản hồi (timeout 30s)
-    int wait_cycles = 300; 
-    while (!g_ai_reply_complete && wait_cycles > 0) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        wait_cycles--;
-    }
-
-    if (wait_cycles == 0) {
-        ESP_LOGE(TAG, "[AUD] Timeout waiting for AI reply!");
+    int content_length = esp_http_client_fetch_headers(client);
+    if (content_length < 0) {
+        ESP_LOGE(TAG, "HTTP client fetch headers failed");
     } else {
-        ESP_LOGI(TAG, "[AUD] AI Reply Complete!");
+        int status_code = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "HTTP POST Status = %d, content_length = %d", status_code, content_length);
+
+        if (status_code == 200) {
+            char read_buf[4096];
+            int read_len;
+            bool is_first_chunk = true;
+            extern void audio_feed_ringbuffer(const uint8_t *data, size_t len);
+            
+            while ((read_len = esp_http_client_read(client, read_buf, sizeof(read_buf))) > 0) {
+                int offset = 0;
+                if (is_first_chunk && read_len >= 44) {
+                    if (strncmp(read_buf, "RIFF", 4) == 0) {
+                        offset = 44;
+                        ESP_LOGI(TAG, "Skipped 44 bytes WAV header in AI response");
+                    }
+                    is_first_chunk = false;
+                }
+                if (read_len - offset > 0) {
+                    audio_feed_ringbuffer((const uint8_t *)(read_buf + offset), read_len - offset);
+                }
+            }
+            ESP_LOGI(TAG, "[AUD] Finished streaming AI reply to ringbuffer");
+        } else {
+            ESP_LOGE(TAG, "Cloud API returned error %d", status_code);
+        }
     }
+    
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
 
-    hf_ws_disconnect(client);
-    return ESP_OK;
-}
-
-// =============================================================================
-// upload_audio_to_hf_buffer:
-//   Gửi trực tiếp raw PCM buffer từ RAM lên HF
-// =============================================================================
-esp_err_t upload_audio_to_hf_buffer(const uint8_t *pcm_buf, size_t pcm_size) {
-    if (!pcm_buf || pcm_size == 0) {
-        return ESP_FAIL;
-    }
-
-    esp_websocket_client_handle_t client = hf_ws_connect();
-    if (!client) {
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(TAG, "[AUD] Sending %zu bytes of raw PCM from RAM...", pcm_size);
-    int result = esp_websocket_client_send_bin(client, (const char*)pcm_buf, pcm_size, portMAX_DELAY);
-
-    if (result < 0) {
-        ESP_LOGE(TAG, "[AUD] WS send PCM failed");
-        hf_ws_disconnect(client);
-        return ESP_FAIL;
-    }
-    ESP_LOGI(TAG, "[AUD] PCM sent OK (%d bytes). Sending stop_audio signal...", result);
-
-    extern volatile bool g_ai_reply_complete;
-    g_ai_reply_complete = false;
-
-    const char *stop_msg = "{\"action\":\"stop_audio\"}";
-    esp_websocket_client_send_text(client, stop_msg, strlen(stop_msg), pdMS_TO_TICKS(5000));
-    ESP_LOGI(TAG, "[AUD] stop_audio sent. Waiting for Server AI to process and return TTS Audio...");
-
-    int wait_cycles = 300; 
-    while (!g_ai_reply_complete && wait_cycles > 0) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        wait_cycles--;
-    }
-
-    if (wait_cycles == 0) {
-        ESP_LOGE(TAG, "[AUD] Timeout waiting for AI reply!");
-    } else {
-        ESP_LOGI(TAG, "[AUD] AI Reply Complete!");
-    }
-
-    hf_ws_disconnect(client);
     return ESP_OK;
 }
 

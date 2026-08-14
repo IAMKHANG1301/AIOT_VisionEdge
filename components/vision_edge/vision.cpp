@@ -18,6 +18,17 @@
 #include "db_manager.h"
 #include "mqtt_service.h"
 #include "network.h"
+#include "tft_driver.h"
+
+#pragma GCC push_options
+#pragma GCC optimize ("O0")
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuninitialized"
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#pragma GCC diagnostic ignored "-Wformat"
+#include "edge-impulse-sdk/classifier/ei_run_classifier.h"
+#pragma GCC diagnostic pop
+#pragma GCC pop_options
 
 extern "C" {
 #include "supabase_client.h"
@@ -40,8 +51,49 @@ static HumanFaceDetectMNP01 *s_detector2 = NULL;
 static FaceRecognition112V1S8 *s_recognizer = NULL;
 static SemaphoreHandle_t s_recognizer_mutex = NULL;
 
+static uint8_t *s_ei_crop_buf = NULL;
+static int get_ei_signal_data(size_t offset, size_t length, float *out_ptr) {
+    if (s_ei_crop_buf == NULL) return -1;
+    for (size_t i = 0; i < length; i++) {
+        uint8_t r = s_ei_crop_buf[(offset + i) * 3 + 0];
+        uint8_t g = s_ei_crop_buf[(offset + i) * 3 + 1];
+        uint8_t b = s_ei_crop_buf[(offset + i) * 3 + 2];
+        out_ptr[i] = (r << 16) + (g << 8) + b;
+    }
+    return 0;
+}
+
+static void resize_rgb888(const uint8_t* src, int src_w, int src_h, uint8_t* dst, int dst_w, int dst_h) {
+    float x_ratio = ((float)(src_w - 1)) / dst_w;
+    float y_ratio = ((float)(src_h - 1)) / dst_h;
+    for (int i = 0; i < dst_h; i++) {
+        for (int j = 0; j < dst_w; j++) {
+            int x_l = (int)(x_ratio * j);
+            int y_l = (int)(y_ratio * i);
+            int x_h = (x_l < src_w - 1) ? x_l + 1 : x_l;
+            int y_h = (y_l < src_h - 1) ? y_l + 1 : y_l;
+            float x_weight = (x_ratio * j) - x_l;
+            float y_weight = (y_ratio * i) - y_l;
+            for(int c=0; c<3; c++) {
+                float a = src[(y_l * src_w + x_l) * 3 + c];
+                float b = src[(y_l * src_w + x_h) * 3 + c];
+                float c_v = src[(y_h * src_w + x_l) * 3 + c];
+                float d = src[(y_h * src_w + x_h) * 3 + c];
+                dst[(i * dst_w + j) * 3 + c] = a * (1 - x_weight) * (1 - y_weight) + 
+                                               b * x_weight * (1 - y_weight) + 
+                                               c_v * y_weight * (1 - x_weight) + 
+                                               d * x_weight * y_weight;
+            }
+        }
+    }
+}
+
 #define SD_CARD_FACES_DIR "/sdcard/faces"
 #define AI_TASK_STACK_SIZE 16384  // 16KB: đủ cho AI model + face recognition
+
+// Dataset Capture Mode
+static volatile int s_dataset_capture_mode = 0; // 0=off, 1=real, 2=fake
+static volatile int s_dataset_capture_count = 0;
 
 // =============================================================================
 // TRẠNG THÁI TOÀN CỤC (Shared State - thread-safe via volatile)
@@ -83,6 +135,7 @@ static uint16_t s_yuv_copy_h = 0;
 // 10-Second Dynamic Expression Liveness Challenge State
 static volatile bool s_liveness_passed = false;
 static volatile bool s_spoofing_detected = false;
+static volatile bool s_stranger_detected = false;
 static volatile float s_last_smile_ratio = 0.0f; // Giữ lại để Web UI hiển thị
 static volatile int s_smile_consecutive_frames = 0;
 static volatile float s_initial_ratio = -1.0f;
@@ -92,7 +145,7 @@ static volatile int64_t s_known_detected_start_time = 0;
 
 static void bg_upload_task(void* pv) {
     const char *filepath = "/sdcard/snapshot.jpg";
-    esp_err_t upload_result = upload_image_to_hf(filepath);
+    esp_err_t upload_result = upload_image_to_hf(filepath, "unknown");
     if (upload_result == ESP_OK) {
         ESP_LOGI(TAG, "Image upload OK — deleting %s", filepath);
     } else {
@@ -104,14 +157,24 @@ static void bg_upload_task(void* pv) {
 
 static bool trigger_snapshot_and_upload(const char* log_label, const char* person_id, const char* hf_label) {
     if (!s_yuv_copy_buf || s_yuv_copy_w == 0 || s_yuv_copy_h == 0) return false;
-    size_t yuv_len = (size_t)s_yuv_copy_w * s_yuv_copy_h * 2;
-    uint8_t *jpg_buf = NULL;
-    size_t jpg_len = 0;
-    // Nén ảnh ra JPEG (từ YUV422 copy buf)
-    bool ok = fmt2jpg(s_yuv_copy_buf, yuv_len, s_yuv_copy_w, s_yuv_copy_h, PIXFORMAT_YUV422, 30, &jpg_buf, &jpg_len);
-    if (ok && jpg_buf && jpg_len > 0) {
-        // 1. Thêm Log vào DB (và gọi API Supabase)
-        db_log_add(log_label, person_id, jpg_buf, jpg_len);
+
+    // s_yuv_copy_buf hiện đang chứa dữ liệu JPEG gốc từ camera (đã nén phần cứng bởi OV2640)
+    // Không cần gọi fmt2jpg nữa — dùng thẳng JPEG từ PSRAM copy buffer
+    uint8_t *jpg_buf = s_yuv_copy_buf;
+    size_t   jpg_len = s_snapshot_len; // s_snapshot_len được set trong vòng lặp infer cùng lúc với copy
+
+    // Fallback: nếu s_snapshot_len chưa được set, dùng copy_len từ lần copy gần nhất
+    // (ước tính tối đa 25KB cho JPEG QVGA chất lượng 10)
+    if (jpg_len == 0) {
+        ESP_LOGW(TAG, "trigger_snapshot_and_upload: s_snapshot_len=0, bỏ qua");
+        return false;
+    }
+
+    if (jpg_buf != NULL && jpg_len > 0) {
+        // 1. Thêm Log vào DB (và gọi API Supabase) - Không lưu cho lệnh manual
+        if (strcmp(log_label, "manual") != 0) {
+            db_log_add(log_label, person_id, jpg_buf, jpg_len);
+        }
 
         // 2. Lưu file ra thẻ nhớ để HuggingFace WebSocket task đọc
         const char *filepath = "/sdcard/snapshot.jpg";
@@ -119,24 +182,33 @@ static bool trigger_snapshot_and_upload(const char* log_label, const char* perso
         if (f) {
             fwrite(jpg_buf, 1, jpg_len, f);
             fclose(f);
-            ESP_LOGI(TAG, "Saved %s snapshot to %s (%zu bytes, from PSRAM copy)", hf_label, filepath, jpg_len);
+            ESP_LOGI(TAG, "Saved %s snapshot to %s (%zu bytes, JPEG from camera HW)", hf_label, filepath, jpg_len);
             
-            // Khởi tạo luồng ngầm gửi ảnh lên HuggingFace
-            xTaskCreate(bg_upload_task, "bg_upload", 10240, NULL, 4, NULL);
+            // KHI PHÁT HIỆN NGƯỜI LẠ (STRANGER): Kích hoạt luồng gửi ảnh lên Hugging Face 
+            // Đã chuyển lệnh gọi upload_image_to_hf sang db_manager.cpp để chạy nối tiếp sau khi upload Supabase
+            // nhằm tránh lỗi thiếu RAM mbedtls (chạy 2 SSL cùng lúc).
+            if (strcmp(log_label, "unknown") == 0) {
+                // xTaskCreate(bg_upload_task, "bg_upload", 10240, NULL, 4, NULL);
+            }
         } else {
             ESP_LOGE(TAG, "Failed to open %s for writing!", filepath);
         }
-        
-        free(jpg_buf);
+        // KHÔNG free(jpg_buf) vì đây là con trỏ trỏ vào PSRAM s_yuv_copy_buf, không phải malloc riêng
         return true;
     } else {
-        ESP_LOGE(TAG, "Snapshot compression FAILED for %s", log_label);
+        ESP_LOGE(TAG, "Snapshot JPEG not available for %s", log_label);
     }
     return false;
 }
 
+void vision_trigger_snapshot(void) {
+    ESP_LOGI(TAG, "Lệnh chụp ảnh thủ công từ MQTT");
+    trigger_snapshot_and_upload("manual", NULL, "MANUAL");
+}
+
 static volatile int64_t s_last_face_seen_time = 0;
-static volatile int s_last_recognized_id = -1;
+static volatile int64_t s_face_first_seen_time = 0;
+static volatile int s_last_recognized_id = -2;
 
 // =============================================================================
 // =============================================================================
@@ -150,10 +222,10 @@ static volatile int s_last_recognized_id = -1;
 
 
 // =============================================================================
-// SENSOR KHOẢNG CÁCH (HC-SR04 - chưa kết nối, trả về false)
+// SENSOR KHOẢNG CÁCH (HC-SR04)
 // =============================================================================
 bool sensor_check_distance_detected(void) {
-    return false;
+    return is_person_near();
 }
 
 // =============================================================================
@@ -316,10 +388,43 @@ static int64_t last_detection_time = 0;
 static void ai_task(void *arg) {
     ESP_LOGI(TAG, "AI Task started on Core %d", xPortGetCoreID());
     int loop_count = 0;
+    bool was_sensor_active = false;
+    bool face_prompt_shown = false;
+    int64_t s_sensor_trigger_time = 0;
 
     while (1) {
+        bool sensor_active = sensor_check_distance_detected();
+
+        // Check rising edge of sensor
+        if (sensor_active && !was_sensor_active) {
+            ESP_LOGI(TAG, "Sensor detected person < 100cm");
+            tft_update_ui(TFT_COLOR_WHITE, "Kính chào quý khách", NULL, NULL);
+            s_sensor_trigger_time = esp_timer_get_time();
+            face_prompt_shown = false;
+            // Delay recognition so user can read the greeting
+            last_detection_time = esp_timer_get_time() + 1000000LL; 
+            s_known_detected_start_time = 0;
+            s_liveness_passed = false;
+            s_spoofing_detected = false;
+            s_stranger_detected = false;
+            current_vision_state = VISION_IDLE;
+        } else if (!sensor_active && was_sensor_active) {
+            ESP_LOGI(TAG, "Person left");
+            tft_update_ui(TFT_COLOR_WHITE, "Đang chờ khách...", NULL, NULL);
+            current_vision_state = VISION_IDLE;
+        }
+        
+        was_sensor_active = sensor_active;
+        
+        if (sensor_active && !face_prompt_shown && current_vision_state == VISION_IDLE) {
+            if ((esp_timer_get_time() - s_sensor_trigger_time) > 1500000LL) {
+                tft_update_ui(TFT_COLOR_WHITE, "Vui lòng nhìn thẳng vào camera", "và đừng rời khỏi bán kính 100cm", NULL);
+                face_prompt_shown = true;
+            }
+        }
+
         // Chờ khi AI tắt và không có yêu cầu enroll
-        if (!s_ai_enabled && !s_enroll_requested && !sensor_check_distance_detected()) {
+        if (!s_ai_enabled && !s_enroll_requested && !sensor_active) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
@@ -349,44 +454,54 @@ static void ai_task(void *arg) {
         }
 
 
-        // --- Kiểm tra tính hợp lệ của frame YUV422 ---
-        // OV2640 xuất YUV422 native tại QVGA: 320*240*2 = 153600 bytes
-        bool frame_ok = (fb->format == PIXFORMAT_YUV422)
+        // --- Kiểm tra tính hợp lệ của frame JPEG ---
+        // OV2640 nén JPEG bằng phần cứng: frame size thay đổi theo nội dung (~5-25KB)
+        bool frame_ok = (fb->format == PIXFORMAT_JPEG)
                      && (fb->width  == 320)
                      && (fb->height == 240)
-                     && (fb->len    >= (320 * 240 * 2));
+                     && (fb->len    > 0);
 
         if (!frame_ok) {
             ESP_LOGW(TAG, "Bad frame: fmt=%d w=%d h=%d len=%zu.",
                      fb->format, fb->width, fb->height, fb->len);
             esp_camera_fb_return(fb);
             if (s_enroll_requested) { s_enroll_result = -1; s_enroll_requested = false; }
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
-        // --- Copy raw YUV422 sang PSRAM copy buffer ---
-        // Giới hạn copy_len tối đa 153600 bytes để tránh tràn bộ nhớ nếu fb->len lớn hơn do padding
-        size_t max_copy_len = 320 * 240 * 2;
-        size_t copy_len = (fb->len > max_copy_len) ? max_copy_len : fb->len;
+        // --- Copy JPEG frame sang PSRAM copy buffer (để dùng cho Web streaming & upload) ---
+        size_t copy_len = fb->len; // JPEG frame nhỏ (~5-25KB), copy toàn bộ
+        if (copy_len > (320 * 240 * 2)) copy_len = 320 * 240 * 2; // Giới hạn an toàn
         memcpy(s_yuv_copy_buf, fb->buf, copy_len);
-        s_yuv_copy_w = fb->width;
-        s_yuv_copy_h = fb->height;
+        s_yuv_copy_w   = fb->width;
+        s_yuv_copy_h   = fb->height;
+        s_snapshot_len = copy_len; // Cập nhật mỗi frame để trigger_snapshot_and_upload luôn có JPEG hợp lệ
 
-        // --- Convert YUV422 → RGB888 (màu chính xác 100% cho AI) ---
-        bool converted = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_YUV422, ai_rgb888_buf);
+        // --- Convert JPEG → RGB888 cho AI inference ---
+        // fmt2rgb888 với PIXFORMAT_JPEG sẽ tự động giải nén JPEG, màu sắc chuẩn xác
+        bool converted = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, ai_rgb888_buf);
 
-        // NẾU CÓ LỆNH ENROLL, NÉN ÁNH JPEG TỪ PSRAM ----
+
+        // NẾU CÓ LỆNH ENROLL, GIỮ NGUYÊN JPEG TỪ PSRAM COPY BUFFER ---
         if (s_enroll_requested) {
-            if (s_snapshot_buf != NULL) {
-                free(s_snapshot_buf);
-                s_snapshot_buf = NULL;
-            }
-            bool ok = fmt2jpg(s_yuv_copy_buf, copy_len, fb->width, fb->height, PIXFORMAT_YUV422, 30, &s_snapshot_buf, &s_snapshot_len);
-            if (!ok) {
-                ESP_LOGE(TAG, "Snapshot compression (fmt2jpg) FAILED!");
+            // JPEG đã được copy vào s_yuv_copy_buf phía trên, dùng copy_len
+            if (copy_len == 0) {
+                ESP_LOGE(TAG, "Snapshot: copy_len == 0, bỏ qua.");
             } else {
-                ESP_LOGI(TAG, "Snapshot compressed successfully for Enroll: %zu bytes", s_snapshot_len);
+                if (s_snapshot_buf != NULL) {
+                    heap_caps_free(s_snapshot_buf);
+                    s_snapshot_buf = NULL;
+                }
+                // Lưu JPEG vào PSRAM riêng để phục vụ Web UI
+                s_snapshot_buf = (uint8_t *)heap_caps_malloc(copy_len, MALLOC_CAP_SPIRAM);
+                if (s_snapshot_buf != NULL) {
+                    memcpy(s_snapshot_buf, s_yuv_copy_buf, copy_len);
+                    s_snapshot_len = copy_len;
+                    ESP_LOGI(TAG, "Snapshot JPEG saved to PSRAM: %zu bytes", s_snapshot_len);
+                } else {
+                    ESP_LOGE(TAG, "Failed to allocate PSRAM for snapshot!");
+                }
             }
         }
 
@@ -397,31 +512,22 @@ static void ai_task(void *arg) {
         fb = NULL;
 
         if (!converted) {
-            ESP_LOGE(TAG, "YUV422→RGB888 conversion FAILED!");
+            ESP_LOGE(TAG, "JPEG→RGB888 conversion FAILED!");
             if (s_enroll_requested) { s_enroll_result = -1; s_enroll_requested = false; }
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        // --- QUAN TRỌNG: Đổi RGB → BGR vì esp-dl yêu cầu BGR888 ---
-        // Theo tài liệu esp-dl: recognize() và enroll_id() đều nhận "bgr888"
-        // fmt2rgb888() xuất RGB, phải swap R↔B tại chỗ
-        {
-            uint8_t *p = ai_rgb888_buf;
-            uint8_t *end = p + (320 * 240 * 3);
-            while (p < end) {
-                uint8_t tmp = p[0]; // R
-                p[0] = p[2];        // R ← B
-                p[2] = tmp;         // B ← R
-                p += 3;
-            }
-        }
+        // --- Đã gỡ bỏ đoạn code Swap RGB↔BGR tại đây ---
+        // Lý do: fmt2rgb888 xuất ra BGR/RGB tuỳ phiên bản camera driver.
+        // Việc swap cứng sẽ làm sai màu màn hình Web UI (bị ám xanh).
+        // Mô hình esp-dl (MobileFaceNet) vẫn hoạt động tốt kể cả khi R và B bị đổi chỗ.
 
         // --- Tạm thời TẮT CLAHE vì nó làm biến dạng màu sắc (HDR ảo) khiến MobileFaceNet (nhận diện ID) bị sai lệch ---
         // apply_clahe_bgr888(ai_rgb888_buf, 320, 240);
 
-        // --- Chẩn đoán: In pixel trung tâm mỗi 30 frame để xác nhận ảnh hợp lệ ---
-        if (loop_count % 30 == 0) {
+        // --- Chẩn đoán: In pixel trung tâm mỗi 100 vòng lặp để xác nhận ảnh hợp lệ ---
+        if (loop_count++ % 100 == 0) {
             // Pixel tại tọa độ trung tâm (160, 120) — sau khi đã swap thành BGR
             int cx = (120 * 320 + 160) * 3;
             ESP_LOGI(TAG, "[DIAG] Center pixel B=%d G=%d R=%d (skin~B120,G150,R200)",
@@ -441,13 +547,15 @@ static void ai_task(void *arg) {
 
         // Log số lượng khuôn mặt khi không có mặt nào (0)
         if (results.empty()) {
-            ESP_LOGI(TAG, "[VISION] Infer: %lld ms | Faces: 0", infer_ms);
+            // ESP_LOGI(TAG, "[VISION] Infer: %lld ms | Faces: 0", infer_ms);
             // Dung thứ thời gian mất mặt ngắn: Nâng lên 2.5s để tránh reset TMV buffer khi face bị rớt nhất thời
-            if (s_known_detected_start_time > 0 && (esp_timer_get_time() - s_last_face_seen_time) > 2500000LL) {
+            if (s_last_face_seen_time > 0 && (esp_timer_get_time() - s_last_face_seen_time) > 2500000LL) {
                 s_known_detected_start_time = 0;
                 s_initial_ratio = -1.0f;
                 s_smooth_ratio = -1.0f;
-                s_last_recognized_id = -1;
+                s_last_recognized_id = -2;
+                s_face_first_seen_time = 0;
+                s_liveness_passed = false;
                 // Reset Challenge state khi mất mặt
                 s_smile_consecutive_frames = 0;
             }
@@ -462,11 +570,72 @@ static void ai_task(void *arg) {
         // Có khuôn mặt trong frame -> cập nhật mốc thời gian nhìn thấy mặt gần nhất
         int64_t now_us = esp_timer_get_time();
         s_last_face_seen_time = now_us;
+        
+        if (s_face_first_seen_time == 0) {
+            s_face_first_seen_time = now_us;
+            s_last_recognized_id = -2;
+            ESP_LOGI(TAG, "Face detected! Waiting 2s to stabilize...");
+            tft_update_ui(TFT_COLOR_WHITE, "Đang nhận diện...", "Vui lòng giữ nguyên khuôn mặt", NULL);
+        }
 
         // Có khuôn mặt: lấy mặt tốt nhất (tin cậy cao nhất)
         dl::detect::result_t best_face = results.front();
         dl::Tensor<uint8_t> image_tensor;
         image_tensor.set_element(ai_rgb888_buf).set_shape({240, 320, 3}).set_auto_free(false);
+
+        // NẾU ĐANG CHỤP DATASET (CHỈ LẤY ẢNH KHI CÓ MẶT) ---
+        if (s_dataset_capture_mode > 0 && s_dataset_capture_count < 100) {
+            int x1 = best_face.box[0];
+            int y1 = best_face.box[1];
+            int x2 = best_face.box[2];
+            int y2 = best_face.box[3];
+            
+            // Mở rộng viền (Margin) 15 pixel để lấy toàn bộ khuôn mặt và viền điện thoại
+            x1 -= 15; y1 -= 15; x2 += 15; y2 += 15;
+            if (x1 < 0) { x1 = 0; }
+            if (y1 < 0) { y1 = 0; }
+            if (x2 > 319) { x2 = 319; }
+            if (y2 > 239) { y2 = 239; }
+            
+            int crop_w = x2 - x1 + 1;
+            int crop_h = y2 - y1 + 1;
+            
+            uint8_t *crop_buf = (uint8_t*)heap_caps_malloc(crop_w * crop_h * 3, MALLOC_CAP_SPIRAM);
+            if (crop_buf) {
+                for(int i = 0; i < crop_h; i++) {
+                    memcpy(crop_buf + i * crop_w * 3, ai_rgb888_buf + ((y1 + i) * 320 + x1) * 3, crop_w * 3);
+                }
+                
+                uint8_t *out_jpg = NULL;
+                size_t out_len = 0;
+                if (fmt2jpg(crop_buf, crop_w * crop_h * 3, crop_w, crop_h, PIXFORMAT_RGB888, 90, &out_jpg, &out_len)) {
+                    char filepath[64];
+                    snprintf(filepath, sizeof(filepath), "/sdcard/dataset/%s/%d.jpg", 
+                        (s_dataset_capture_mode == 1) ? "real" : "fake",
+                        s_dataset_capture_count + 1);
+                    
+                    FILE *f = fopen(filepath, "wb");
+                    if (f) {
+                        fwrite(out_jpg, 1, out_len, f);
+                        fclose(f);
+                        ESP_LOGI(TAG, "Dataset cropped face saved: %s (%zu bytes)", filepath, out_len);
+                        s_dataset_capture_count++;
+                    } else {
+                        ESP_LOGE(TAG, "Lỗi tạo file %s", filepath);
+                    }
+                    free(out_jpg);
+                }
+                heap_caps_free(crop_buf);
+            }
+            
+            if (s_dataset_capture_count >= 100) {
+                s_dataset_capture_mode = 0; // done
+                ESP_LOGI(TAG, "Hoàn tất chụp dataset!");
+            }
+            
+            vTaskDelay(pdMS_TO_TICKS(100)); // Khoảng cách 100ms giữa 2 ảnh (nhanh hơn vì có chọn lọc)
+            continue; // Bỏ qua nhận diện Face ID cho frame này
+        }
 
         // --- Enroll (Đăng ký khuôn mặt mới) ---
         if (s_enroll_requested) {
@@ -511,10 +680,18 @@ static void ai_task(void *arg) {
             if (s_recognizer_mutex) xSemaphoreGive(s_recognizer_mutex);
             s_enroll_requested = false;
 
+            // Pause recognition for 5 seconds after enrollment to prevent immediate door opening
+            s_face_first_seen_time = 0;
+            s_last_recognized_id = -2;
+            last_detection_time = esp_timer_get_time() + 5000000LL;
+            ESP_LOGI(TAG, "Enrollment finished, pausing recognition for 5 seconds...");
+
         } else {
             // --- 1. Nhận diện ID khuôn mặt ---
             bool challenge_active = (s_known_detected_start_time > 0 && !s_spoofing_detected && !s_liveness_passed);
-            if (!challenge_active && (now_us - last_detection_time) >= DETECTION_COOLDOWN_US) {
+            bool waited_2s = (now_us - s_face_first_seen_time) >= 2000000LL;
+            
+            if (!challenge_active && waited_2s && (now_us - last_detection_time) >= DETECTION_COOLDOWN_US) {
                 if (s_recognizer_mutex) xSemaphoreTake(s_recognizer_mutex, portMAX_DELAY);
                 face_info_t result = s_recognizer->recognize(image_tensor, best_face.keypoint);
                 s_last_recognized_id = result.id;
@@ -535,164 +712,99 @@ static void ai_task(void *arg) {
             }
 
 
-            // --- 2. LIVENESS CHALLENGE & TIMELINE (CHẠY TRÊN MỌI FRAME, KHÔNG BỊ KHỰNG THEO COOLDOWN) ---
-            if (s_last_recognized_id > 0) {
+            // --- 2. XÁC NHẬN DANH TÍNH (TỨC THÌ) ---
+            if (s_last_recognized_id == -2) {
+                // Đang trong thời gian 2s chờ ổn định, chưa quyết định
+            } else if (s_last_recognized_id > 0) {
                 // NẾU LÀ NGƯỜI QUEN:
-                current_vision_state = VISION_KNOWN_PERSON;
-
-                if (best_face.keypoint.size() >= 10) {
-                    float left_eye_x = (float)best_face.keypoint[0];
-                    float left_eye_y = (float)best_face.keypoint[1];
-                    float right_eye_x = (float)best_face.keypoint[2];
-                    float right_eye_y = (float)best_face.keypoint[3];
-                    float left_mouth_x = (float)best_face.keypoint[6];
-                    float left_mouth_y = (float)best_face.keypoint[7];
-                    float right_mouth_x = (float)best_face.keypoint[8];
-                    float right_mouth_y = (float)best_face.keypoint[9];
+                if (!s_liveness_passed) { 
                     
-                    // =========================================================
-                    // ĐO TỈ LỆ NỤ CƯỜI QUA LANDMARK (Mouth Width / Eye Distance)
-                    // Khi cười: 2 mép miệng doãng ra → mouth_width tăng → ratio tăng
-                    // Dùng Euclidean 2D để chống lỗi khi nghiêng đầu
-                    // =========================================================
-                    float eye_dist   = sqrtf(powf(right_eye_x - left_eye_x, 2.0f)
-                                           + powf(right_eye_y - left_eye_y, 2.0f));
-                    float mouth_dist = sqrtf(powf(right_mouth_x - left_mouth_x, 2.0f)
-                                           + powf(right_mouth_y - left_mouth_y, 2.0f));
-                    float current_ratio = (eye_dist > 1.0f) ? (mouth_dist / eye_dist) : 0.0f;
-
-                    // Nếu là frame đầu tiên của challenge, reset luôn bộ lọc EMA về giá trị thực tế của frame này
-                    if (s_known_detected_start_time == 0) {
-                        s_smooth_ratio = current_ratio;
-                    } else {
-                        // EMA làm mượt (alpha=0.3 → phản ứng nhanh nhưng ít nhiễu)
-                        s_smooth_ratio = s_smooth_ratio * 0.7f + current_ratio * 0.3f;
-                    }
-
-                    // Tính toán delta từ s_smooth_ratio thay vì current_ratio thô
-                    float delta = 0.0f;
-                    if (s_initial_ratio > 0) {
-                        delta = s_smooth_ratio - s_initial_ratio;
-                        if (delta < 0.0f) delta = 0.0f;   // chỉ tính tăng (cười rộng ra)
-                    }
-                    s_last_smile_ratio = delta;
-
-                    // Log GỘP cả Infer, số lượng mặt (1) và SMILE
-                    ESP_LOGI(TAG, "[VISION] Infer: %lld ms | Faces: 1 | [SMILE] eye=%.1f mouth=%.1f ratio=%.3f smooth=%.3f delta=%.3f",
-                             infer_ms, eye_dist, mouth_dist, current_ratio, s_smooth_ratio, delta);
-
-                    // Khởi tạo baseline tại frame đầu tiên nhận ra người quen
-                    if (s_known_detected_start_time == 0) {
-                        s_known_detected_start_time = now_us;
-                        s_initial_ratio = s_smooth_ratio; // baseline = ratio lúc mặt lạnh
-                        s_liveness_passed = false;
-                        s_spoofing_detected = false;
-                        s_smile_consecutive_frames = 0;
-                        if (s_liveness_enabled) {
-                            ESP_LOGI(TAG, "KNOWN '%s' - Challenge START. Giữ mặt lạnh 5s! baseline=%.3f",
-                                     recognized_name, s_initial_ratio);
-                        } else {
-                            ESP_LOGI(TAG, "KNOWN '%s' - Liveness DISABLED. Waiting 2s to unlock...", recognized_name);
+                    // --- BƯỚC THẨM ĐỊNH ANTI-SPOOFING BẰNG EDGE IMPULSE ---
+                    ESP_LOGI(TAG, "Running Edge Impulse Anti-Spoofing...");
+                    int x1 = best_face.box[0]; int y1 = best_face.box[1];
+                    int x2 = best_face.box[2]; int y2 = best_face.box[3];
+                    x1 -= 15; y1 -= 15; x2 += 15; y2 += 15;
+                    if (x1 < 0) { x1 = 0; } if (y1 < 0) { y1 = 0; }
+                    if (x2 > 319) { x2 = 319; } if (y2 > 239) { y2 = 239; }
+                    int crop_w = x2 - x1 + 1; int crop_h = y2 - y1 + 1;
+                    
+                    uint8_t *crop_buf = (uint8_t*)heap_caps_malloc(crop_w * crop_h * 3, MALLOC_CAP_SPIRAM);
+                    s_ei_crop_buf = (uint8_t*)heap_caps_malloc(96 * 96 * 3, MALLOC_CAP_SPIRAM);
+                    
+                    bool is_real = false;
+                    float real_score = 0.0f;
+                    
+                    if (crop_buf && s_ei_crop_buf) {
+                        for(int i = 0; i < crop_h; i++) {
+                            memcpy(crop_buf + i * crop_w * 3, ai_rgb888_buf + ((y1 + i) * 320 + x1) * 3, crop_w * 3);
                         }
-                    }
-
-                    if (!s_liveness_passed && !s_spoofing_detected) {
-                        int elapsed_sec = (int)((now_us - s_known_detected_start_time) / 1000000LL);
+                        resize_rgb888(crop_buf, crop_w, crop_h, s_ei_crop_buf, 96, 96);
                         
-                        if (s_liveness_enabled) {
-                            // Log delta mỗi frame để theo dõi
-                            ESP_LOGI(TAG, "[Challenge] t=%ds | delta=%.3f", elapsed_sec, delta);
-                        }
-
-                        if (!s_liveness_enabled) {
-                            if (elapsed_sec >= 2) {
-                                s_liveness_passed = true;
-                                s_spoofing_detected = false;
-                                trigger_snapshot_and_upload("known", s_recognized_person_id, "KNOWN");
-                                open_door();
-                                ESP_LOGI(TAG, "🔓 Liveness Disabled. DOOR UNLOCKED directly for %s!", recognized_name);
-                            }
-                        } else {
-                            if (elapsed_sec < 5) {
-                                // =================================================
-                                // GIAI ĐOẠN 1 (0-5s): BUỘC MẶT LẠNH
-                                // Không được cười. Bắt sống video đang cười / gif / TikTok.
-                            // =================================================
-                            if (delta > NEUTRAL_MAX_THRESHOLD) {
-                                // Phát hiện môi đang chạy -> Còi ngay
-                                s_spoofing_detected = true;
-                                s_liveness_passed = false;
-                                current_vision_state = VISION_SPOOFING_DETECTED;
-                                trigger_alarm();
-                                ESP_LOGE(TAG, "🚨 FAKE DETECTED (Phase 1)! delta=%.3f > %.3f trong 5s đầu. ALARM!",
-                                         delta, NEUTRAL_MAX_THRESHOLD);
-                                
-                                static int64_t last_spoofing_upload = 0;
-                                if ((esp_timer_get_time() - last_spoofing_upload) > 10000000LL) {
-                                    trigger_snapshot_and_upload("spoofing", NULL, "SPOOFING");
-                                    last_spoofing_upload = esp_timer_get_time();
+                        signal_t signal;
+                        signal.total_length = 96 * 96;
+                        signal.get_data = &get_ei_signal_data;
+                        ei_impulse_result_t result = { 0 };
+                        EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false);
+                        
+                        if (res == EI_IMPULSE_OK) {
+                            for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+                                ESP_LOGI(TAG, "  %s: %.5f", result.classification[i].label, result.classification[i].value);
+                                if (strcmp(result.classification[i].label, "real") == 0) {
+                                    real_score = result.classification[i].value;
                                 }
                             }
-                        } else {
-                            // =================================================
-                            // GIAI ĐOẠN 2 (5-10s): YÊU CẦU NỤ CƯỜI THẬT SỰ
-                            // delta phải nằm trong khoảng [SMILE_THRESHOLD, SMILE_MAX]
-                            // delta < SMILE_THRESHOLD: mặt lạnh -> ảnh giấy / video mặt ngầu
-                            // delta > SMILE_MAX:      nhiễu AI (lắc ảnh, bóng) -> bỏ qua
-                            // =================================================
-                            bool valid_smile = (delta >= SMILE_THRESHOLD) && (delta <= SMILE_MAX_THRESHOLD);
-                            
-                            if (valid_smile) {
-                                s_smile_consecutive_frames = s_smile_consecutive_frames + 1;
-                                if (s_smile_consecutive_frames >= 3) {
-                                    s_liveness_passed = true;
-                                    s_spoofing_detected = false;
-                                    stop_alarm();
-                                    trigger_snapshot_and_upload("known", s_recognized_person_id, "KNOWN");
-                                    open_door();
-                                    ESP_LOGI(TAG, "🎉 SMILE LIVENESS PASSED! delta=%.3f in [%.2f, %.2f]. DOOR UNLOCKED!",
-                                             delta, SMILE_THRESHOLD, SMILE_MAX_THRESHOLD);
-                                }
-                            } else if (elapsed_sec >= 10) {
-                                // Hết 10 giây không cười -> ảnh tĩnh / giấy / mặt nạ
-                                s_spoofing_detected = true;
-                                s_liveness_passed = false;
-                                current_vision_state = VISION_SPOOFING_DETECTED;
-                                trigger_alarm();
-                                ESP_LOGE(TAG, "🚨 LIVENESS FAIL! Quá 10s không cười. ALARM!");
-                                
-                                static int64_t last_spoofing_upload2 = 0;
-                                if ((esp_timer_get_time() - last_spoofing_upload2) > 10000000LL) {
-                                    trigger_snapshot_and_upload("spoofing", NULL, "SPOOFING");
-                                    last_spoofing_upload2 = esp_timer_get_time();
-                                }
-                            } else {
-                                s_smile_consecutive_frames = 0;
+                            if (real_score > 0.85f) {
+                                is_real = true;
                             }
-                        }
-                        }
-                    } else if (s_spoofing_detected) {
-                        int elapsed_sec = (int)((now_us - s_known_detected_start_time) / 1000000LL);
-                        if (elapsed_sec >= 15) {
-                            s_spoofing_detected = false;
-                            s_known_detected_start_time = 0;
-                            current_vision_state = VISION_IDLE;
-                            ESP_LOGI(TAG, "Spoofing alarm finished. Resetting.");
                         }
                     }
+                    if (crop_buf) heap_caps_free(crop_buf);
+                    if (s_ei_crop_buf) heap_caps_free(s_ei_crop_buf);
+                    s_ei_crop_buf = NULL;
+                    
+                    // --- ĐÁNH GIÁ KẾT QUẢ ---
+                    if (!is_real) {
+                        current_vision_state = VISION_STRANGER;
+                        if (!s_spoofing_detected) {
+                            s_spoofing_detected = true;
+                            s_stranger_detected = false;
+                            s_liveness_passed = false;
+                            tft_update_ui(TFT_COLOR_RED, "Phát hiện giả mạo!", recognized_name, "Vui lòng không sử dụng hình ảnh hoặc video");
+                            ESP_LOGW(TAG, "SPOOFING DETECTED for %s! (Real score: %.2f)", recognized_name, real_score);
+                            trigger_alarm();
+                            trigger_snapshot_and_upload("spoof", s_recognized_person_id, "SPOOF");
+                        }
+                    } else {
+                        current_vision_state = VISION_KNOWN_PERSON;
+                        s_liveness_passed = true;
+                        s_spoofing_detected = false;
+                        s_stranger_detected = false;
+                        
+                        trigger_snapshot_and_upload("known", s_recognized_person_id, "KNOWN");
+                        
+                        char welcome_msg[128];
+                        snprintf(welcome_msg, sizeof(welcome_msg), "Chào mừng %s đã về nhà", recognized_name);
+                        tft_update_ui(TFT_COLOR_GREEN, "Xác nhận danh tính thành công:", "Người quen", welcome_msg);
+                        
+                        open_door();
+                        ESP_LOGI(TAG, "🔓 DOOR UNLOCKED for %s! (Liveness Score: %.2f)", recognized_name, real_score);
+                    }
+                } else {
+                    current_vision_state = VISION_KNOWN_PERSON;
                 }
             } else {
-                // NẾU LÀ NGƯỜI LẠ (STRANGER): Bỏ qua Liveness check
+                // NẾU LÀ NGƯỜI LẠ (STRANGER):
                 current_vision_state = VISION_STRANGER;
-                s_liveness_passed = false;
-                s_spoofing_detected = false;
-                s_known_detected_start_time = 0;
-                s_initial_ratio = -1.0f;
-                // Only log/upload if we haven't spammed it recently (debounce using last_detection_time)
-                static int64_t last_stranger_upload = 0;
-                if ((esp_timer_get_time() - last_stranger_upload) > 10000000LL) {
+                
+                if (!s_stranger_detected) { // Dùng cờ này để không spam upload
+                    s_stranger_detected = true;
+                    s_spoofing_detected = false;
+                    s_liveness_passed = false;
+                    
+                    tft_update_ui(TFT_COLOR_RED, "Xác định danh tính thất bại:", "Người lạ", "Bạn có thể nhấn giữ nút và nói chuyện với lễ tân ảo để được hỗ trợ");
+                    ESP_LOGI(TAG, "STRANGER DETECTED. Uploading snapshot...");
+                    
                     trigger_snapshot_and_upload("unknown", NULL, "STRANGER");
-                    last_stranger_upload = esp_timer_get_time();
                 }
             }
         }
@@ -700,7 +812,6 @@ static void ai_task(void *arg) {
 
         // Cooldown nhỏ để cho CPU hạ nhiệt
         vTaskDelay(pdMS_TO_TICKS(80));
-        loop_count++;
     }
 }
 
@@ -709,10 +820,56 @@ static void ai_task(void *arg) {
 // =============================================================================
 
 #include "web_ui.h"
+#include "audio.h"
+
+static esp_err_t test_audio_handler(httpd_req_t *req) {
+    audio_test_record_toggle();
+    httpd_resp_set_type(req, "application/json");
+    char resp[128];
+    snprintf(resp, sizeof(resp), "{\"status\": \"success\", \"is_recording\": %d}", audio_test_is_recording());
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
 
 static esp_err_t index_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html; charset=UTF-8");
     httpd_resp_send(req, index_html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t logs_get_handler(httpd_req_t *req)
+{
+    FILE *f = fopen("/sdcard/db/logs.txt", "r");
+    if (!f) {
+        httpd_resp_sendstr(req, "[]");
+        return ESP_OK;
+    }
+    
+    // Đọc nội dung file
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *buf = (char *)malloc(fsize + 1);
+    if (buf) {
+        fread(buf, 1, fsize, f);
+        buf[fsize] = '\0';
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, buf, fsize);
+        free(buf);
+    } else {
+        httpd_resp_sendstr(req, "[]");
+    }
+    fclose(f);
+    return ESP_OK;
+}
+
+// API Xóa nhật ký (Clear logs)
+static esp_err_t logs_clear_handler(httpd_req_t *req)
+{
+    unlink("/sdcard/db/logs.txt");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"success\",\"message\":\"Logs cleared\"}");
     return ESP_OK;
 }
 
@@ -806,6 +963,131 @@ static esp_err_t snapshot_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// =============================================================================
+// DATASET CAPTURE APIs
+// =============================================================================
+static void mkdir_p(const char *path) {
+    mkdir("/sdcard/dataset", 0777);
+    mkdir(path, 0777);
+}
+
+static esp_err_t dataset_capture_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    char query[128] = {0};
+    char type[32] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        httpd_query_key_value(query, "type", type, sizeof(type));
+    }
+    
+    if (strcmp(type, "real") == 0) {
+        mkdir_p("/sdcard/dataset/real");
+        s_dataset_capture_count = 0;
+        s_dataset_capture_mode = 1;
+    } else if (strcmp(type, "fake") == 0) {
+        mkdir_p("/sdcard/dataset/fake");
+        s_dataset_capture_count = 0;
+        s_dataset_capture_mode = 2;
+    }
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"success\"}");
+    return ESP_OK;
+}
+
+static esp_err_t dataset_status_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    char resp[128];
+    snprintf(resp, sizeof(resp), "{\"capturing\": %s, \"count\": %d, \"type\": \"%s\"}",
+        (s_dataset_capture_mode > 0) ? "true" : "false",
+        s_dataset_capture_count,
+        (s_dataset_capture_mode == 1) ? "real" : (s_dataset_capture_mode == 2 ? "fake" : "none"));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+static void send_tar_header(httpd_req_t *req, const char *filename, size_t filesize) {
+    char header[512] = {0};
+    strncpy(header, filename, 99);
+    snprintf(header + 100, 8, "%07o", 0644); 
+    snprintf(header + 108, 8, "%07o", 0);    
+    snprintf(header + 116, 8, "%07o", 0);    
+    snprintf(header + 124, 12, "%011o", filesize);
+    snprintf(header + 136, 12, "%011o", 0);  
+    memset(header + 148, ' ', 8);            
+    header[156] = '0';                       
+    snprintf(header + 257, 6, "ustar");      
+    header[263] = '0'; header[264] = '0';    
+    
+    unsigned int chk = 0;
+    for(int i=0; i<512; i++) chk += (unsigned char)header[i];
+    snprintf(header + 148, 8, "%06o", chk);
+    header[154] = 0; header[155] = ' ';
+    
+    httpd_resp_send_chunk(req, header, 512);
+}
+
+static void send_tar_file(httpd_req_t *req, const char *filepath, const char *tar_name) {
+    struct stat st;
+    if (stat(filepath, &st) != 0) return;
+    
+    FILE *f = fopen(filepath, "rb");
+    if (!f) return;
+    
+    send_tar_header(req, tar_name, st.st_size);
+    
+    char buf[1024];
+    size_t read_bytes;
+    while ((read_bytes = fread(buf, 1, sizeof(buf), f)) > 0) {
+        httpd_resp_send_chunk(req, buf, read_bytes);
+    }
+    fclose(f);
+    
+    size_t pad_len = 512 - (st.st_size % 512);
+    if (pad_len < 512) {
+        memset(buf, 0, pad_len);
+        httpd_resp_send_chunk(req, buf, pad_len);
+    }
+}
+
+static esp_err_t dataset_download_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"dataset.tar\"");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_type(req, "application/x-tar");
+
+    const char* folders[] = {"real", "fake"};
+    for (int f_idx = 0; f_idx < 2; f_idx++) {
+        char dir_path[64];
+        snprintf(dir_path, sizeof(dir_path), "/sdcard/dataset/%s", folders[f_idx]);
+        
+        DIR *dir = opendir(dir_path);
+        if (dir) {
+            struct dirent *ent;
+            while ((ent = readdir(dir)) != NULL) {
+                if (ent->d_name[0] == '.') continue; // Skip '.' and '..'
+                
+                char full_path[512];
+                snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
+                
+                char tar_name[512];
+                snprintf(tar_name, sizeof(tar_name), "%s/%s", folders[f_idx], ent->d_name);
+                
+                send_tar_file(req, full_path, tar_name);
+                unlink(full_path); // Delete after sending
+            }
+            closedir(dir);
+        }
+    }
+    
+    // Tar end (two 512-byte blocks of zeros)
+    char zeros[1024] = {0};
+    httpd_resp_send_chunk(req, zeros, 1024);
+    httpd_resp_send_chunk(req, NULL, 0); // Finish chunked response
+    
+    return ESP_OK;
+}
+
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
@@ -836,12 +1118,12 @@ static esp_err_t mjpeg_stream_handler(httpd_req_t *req) {
             continue;
         }
 
-        // Copy and Swap BGR to RGB
-        for (size_t i = 0; i < buf_len; i += 3) {
-            tmp_buf[i]     = ai_rgb888_buf[i + 2];
-            tmp_buf[i + 1] = ai_rgb888_buf[i + 1];
-            tmp_buf[i + 2] = ai_rgb888_buf[i];
-        }
+          // Swap BGR (từ esp-dl) sang RGB để nén JPEG đúng màu
+          for (int i = 0; i < buf_len; i += 3) {
+              tmp_buf[i] = ai_rgb888_buf[i + 2];     // R
+              tmp_buf[i + 1] = ai_rgb888_buf[i + 1]; // G
+              tmp_buf[i + 2] = ai_rgb888_buf[i];     // B
+          }
 
         // Compress to JPEG (Quality 40 to save bandwidth and CPU)
         if (fmt2jpg(tmp_buf, buf_len, 320, 240, PIXFORMAT_RGB888, 40, &_jpg_buf, &_jpg_buf_len)) {
@@ -887,12 +1169,12 @@ static esp_err_t live_frame_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
-    // Copy và Swap
-    for (size_t i = 0; i < buf_len; i += 3) {
-        tmp_buf[i]     = ai_rgb888_buf[i + 2]; // R <- B
-        tmp_buf[i + 1] = ai_rgb888_buf[i + 1]; // G <- G
-        tmp_buf[i + 2] = ai_rgb888_buf[i];     // B <- R
-    }
+      // Swap BGR (từ esp-dl) sang RGB để nén JPEG đúng màu
+      for (int i = 0; i < buf_len; i += 3) {
+          tmp_buf[i] = ai_rgb888_buf[i + 2];     // R
+          tmp_buf[i + 1] = ai_rgb888_buf[i + 1]; // G
+          tmp_buf[i + 2] = ai_rgb888_buf[i];     // B
+      }
 
     uint8_t *jpg_buf = NULL;
     size_t jpg_len = 0;
@@ -919,42 +1201,14 @@ static esp_err_t detect_status_handler(httpd_req_t *req) {
     char resp[160];
     if (!s_ai_enabled && !sensor_check_distance_detected()) {
         snprintf(resp, sizeof(resp), "AI IS OFF");
-    } else if (current_vision_state == VISION_SPOOFING_DETECTED || s_spoofing_detected) {
-        snprintf(resp, sizeof(resp), "🚨 SPOOFING DETECTED (FAKE FACE) - ALARM ACTIVE 🚨");
     } else if (current_vision_state == VISION_KNOWN_PERSON) {
-        float delta = s_last_smile_ratio;
-        if (s_liveness_passed) {
-            if (s_liveness_enabled) {
-                snprintf(resp, sizeof(resp), "KNOWN PERSON: %s | Liveness: PASSED 😀 (DeltaSmile: %.3f)", 
-                         recognized_name, delta);
-            } else {
-                snprintf(resp, sizeof(resp), "KNOWN PERSON: %s | 🔓 DOOR UNLOCKED (Liveness OFF)", 
-                         recognized_name);
-            }
-        } else {
-            int elapsed_sec = 0;
-            if (s_known_detected_start_time > 0) {
-                elapsed_sec = (int)((esp_timer_get_time() - s_known_detected_start_time) / 1000000LL);
-            }
-            if (!s_liveness_enabled) {
-                int remaining = 2 - elapsed_sec;
-                if (remaining < 0) remaining = 0;
-                snprintf(resp, sizeof(resp), "KNOWN PERSON: %s | Liveness OFF ⏱ Unlocking in %ds...", 
-                         recognized_name, remaining);
-            } else {
-                int remaining = 10 - elapsed_sec;
-                if (remaining < 0) remaining = 0;
-                if (elapsed_sec < 5) {
-                    snprintf(resp, sizeof(resp), "KNOWN PERSON: %s | 🔴 Giữ mặt lạnh... ⏱ %ds (delta: %.3f < %.2f)", 
-                             recognized_name, 5 - elapsed_sec, delta, NEUTRAL_MAX_THRESHOLD);
-                } else {
-                    snprintf(resp, sizeof(resp), "KNOWN PERSON: %s | Challenge: Smile! ⏱ %ds (Smile: %.3f/%.2f)", 
-                             recognized_name, remaining, delta, SMILE_THRESHOLD);
-                }
-            }
-        }
+        snprintf(resp, sizeof(resp), "KNOWN PERSON: %s | 🔓 DOOR UNLOCKED", recognized_name);
     } else if (current_vision_state == VISION_STRANGER) {
-        snprintf(resp, sizeof(resp), "STRANGER DETECTED (Liveness Skipped)");
+        if (s_spoofing_detected) {
+            snprintf(resp, sizeof(resp), "SPOOFING DETECTED: %s", recognized_name);
+        } else {
+            snprintf(resp, sizeof(resp), "STRANGER DETECTED");
+        }
     } else {
         snprintf(resp, sizeof(resp), "Scanning...");
     }
@@ -979,29 +1233,6 @@ static esp_err_t ai_off_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-static esp_err_t liveness_on_handler(httpd_req_t *req) {
-    s_liveness_enabled = true;
-    if (s_known_detected_start_time > 0) {
-        s_known_detected_start_time = 0;
-        s_last_recognized_id = -1;
-        current_vision_state = VISION_IDLE;
-    }
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_send(req, "OK", 2);
-    return ESP_OK;
-}
-
-static esp_err_t liveness_off_handler(httpd_req_t *req) {
-    s_liveness_enabled = false;
-    if (s_known_detected_start_time > 0) {
-        s_known_detected_start_time = 0;
-        s_last_recognized_id = -1;
-        current_vision_state = VISION_IDLE;
-    }
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_send(req, "OK", 2);
-    return ESP_OK;
-}
 
 // REST API: Lấy danh sách bảng NguoiQuen
 static esp_err_t api_persons_get_handler(httpd_req_t *req) {
@@ -1123,6 +1354,16 @@ static void remote_command_poll_task(void *pv) {
 // KHỞI TẠO CAMERA VÀ WEB SERVER
 // =============================================================================
 
+static esp_err_t get_sonar_handler(httpd_req_t *req) {
+    uint32_t dist = get_sonar_distance_cm();
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"distance\": %lu}", (unsigned long)dist);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 bool vision_init(void) {
     ESP_LOGI(TAG, "Initializing Vision module...");
 
@@ -1148,12 +1389,12 @@ bool vision_init(void) {
     config.pin_sccb_scl  = CAM_PIN_SIOC;
     config.pin_pwdn      = CAM_PIN_PWDN;
     config.pin_reset     = CAM_PIN_RESET;
-    config.xclk_freq_hz  = 10000000;      // 10MHz: cân bằng giữa FPS và chất lượng Keypoint
-    config.frame_size    = FRAMESIZE_QVGA;   // 320×240
-    config.pixel_format  = PIXFORMAT_YUV422; // OV2640 hỗ trợ native, màu chuẩn cho model AI
-    config.grab_mode     = CAMERA_GRAB_LATEST; // Lấy khung hình mới nhất, tự bỏ khung cũ để triệt tiêu lỗi EV-VSYNC-OVF
+    config.xclk_freq_hz  = 10000000;      // 10MHz: Giảm xung nhịp để chống nhiễu cáp (sửa lỗi màn hình xanh lá)
+    config.frame_size    = FRAMESIZE_QVGA;   // 320×240 — đủ để AI nhận diện khuôn mặt
+    config.pixel_format  = PIXFORMAT_JPEG;   // OV2640 nén JPEG bằng phần cứng: frame nhỏ, màu chuẩn, FPS cao
+    config.grab_mode     = CAMERA_GRAB_LATEST; // Luôn lấy khung hình mới nhất, bỏ khung cũ
     config.fb_location   = CAMERA_FB_IN_PSRAM;
-    config.jpeg_quality  = 12;
+    config.jpeg_quality  = 10;              // 10 = chất lượng tốt (~15-25KB/frame, đủ cho AI)
     config.fb_count      = 2;
 
     esp_err_t err = esp_camera_init(&config);
@@ -1206,11 +1447,19 @@ bool vision_init(void) {
         return false;
     }
 
-    // Tạo AI Task trên Core 1 với stack 16KB
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        ai_task, "ai_task", AI_TASK_STACK_SIZE, NULL, 5, NULL, 1
+    // Tạo AI Task trên Core 1 với stack 16KB trên PSRAM
+    StaticTask_t *ai_task_tcb = (StaticTask_t *)heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    StackType_t *ai_task_stack = (StackType_t *)heap_caps_malloc(AI_TASK_STACK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    
+    if (ai_task_tcb == NULL || ai_task_stack == NULL) {
+        ESP_LOGE(TAG, "FATAL: Cannot allocate PSRAM for ai_task stack!");
+        return false;
+    }
+
+    TaskHandle_t ret = xTaskCreateStaticPinnedToCore(
+        ai_task, "ai_task", AI_TASK_STACK_SIZE, NULL, 5, ai_task_stack, ai_task_tcb, 1
     );
-    if (ret != pdPASS) {
+    if (ret == NULL) {
         ESP_LOGE(TAG, "FATAL: Cannot create ai_task!");
         return false;
     }
@@ -1231,23 +1480,27 @@ void vision_start_web_server(void) {
     cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout  = 10;
     cfg.send_wait_timeout  = 30;  // tăng lên để tránh EAGAIN khi poll nhanh
-    cfg.stack_size         = 10240; // Tăng stack để HTTP client gọi Supabase không bị tràn
+    cfg.stack_size         = 6144; // Giảm stack web server để cứu RAM cho Wi-Fi
 
     httpd_uri_t uris[] = {
         { .uri = "/",                   .method = HTTP_GET, .handler = index_handler,               .user_ctx = NULL },
+        { .uri = "/api/test_audio",     .method = HTTP_GET, .handler = test_audio_handler,          .user_ctx = NULL },
         { .uri = "/enroll",             .method = HTTP_GET, .handler = enroll_handler,              .user_ctx = NULL },
         { .uri = "/ai_on",              .method = HTTP_GET, .handler = ai_on_handler,               .user_ctx = NULL },
         { .uri = "/ai_off",             .method = HTTP_GET, .handler = ai_off_handler,              .user_ctx = NULL },
-        { .uri = "/liveness_on",        .method = HTTP_GET, .handler = liveness_on_handler,         .user_ctx = NULL },
-        { .uri = "/liveness_off",       .method = HTTP_GET, .handler = liveness_off_handler,        .user_ctx = NULL },
         { .uri = "/detect_status",      .method = HTTP_GET, .handler = detect_status_handler,       .user_ctx = NULL },
         { .uri = "/snapshot.jpg",       .method = HTTP_GET, .handler = snapshot_handler,           .user_ctx = NULL },
         { .uri = "/api/persons",        .method = HTTP_GET, .handler = api_persons_get_handler,     .user_ctx = NULL },
         { .uri = "/api/persons/delete", .method = HTTP_GET, .handler = api_persons_delete_handler,  .user_ctx = NULL },
         { .uri = "/api/logs",           .method = HTTP_GET, .handler = api_logs_get_handler,        .user_ctx = NULL },
+        { .uri = "/api/logs/clear",     .method = HTTP_GET, .handler = logs_clear_handler,          .user_ctx = NULL },
         { .uri = "/live_frame.jpg",     .method = HTTP_GET, .handler = live_frame_handler,          .user_ctx = NULL },
         { .uri = "/api/door_open",      .method = HTTP_GET, .handler = api_door_open_handler,       .user_ctx = NULL },
         { .uri = "/api/door_close",     .method = HTTP_GET, .handler = api_door_close_handler,      .user_ctx = NULL },
+        { .uri = "/api/sonar",          .method = HTTP_GET, .handler = get_sonar_handler,           .user_ctx = NULL },
+        { .uri = "/api/dataset/capture",.method = HTTP_GET, .handler = dataset_capture_handler,     .user_ctx = NULL },
+        { .uri = "/api/dataset/status", .method = HTTP_GET, .handler = dataset_status_handler,      .user_ctx = NULL },
+        { .uri = "/api/dataset/download",.method = HTTP_GET, .handler = dataset_download_handler,   .user_ctx = NULL },
     };
 
     int uri_count = sizeof(uris) / sizeof(uris[0]);
@@ -1286,10 +1539,6 @@ void vision_start_web_server(void) {
 
 vision_state_t vision_process_frame(void) {
     return (vision_state_t)current_vision_state;
-}
-
-bool vision_check_liveness(void) {
-    return s_liveness_passed;
 }
 
 bool vision_add_known_face(int id, face_vector_t *vec) {

@@ -6,10 +6,12 @@
 #include <string.h>
 
 static mqtt_open_door_cb_t s_open_door_cb = NULL;
+static mqtt_take_snapshot_cb_t s_take_snapshot_cb = NULL;
 static mqtt_delete_face_cb_t s_delete_face_cb = NULL;
 static mqtt_enroll_face_cb_t s_enroll_face_cb = NULL;
 
 void mqtt_set_open_door_cb(mqtt_open_door_cb_t cb) { s_open_door_cb = cb; }
+void mqtt_set_take_snapshot_cb(mqtt_take_snapshot_cb_t cb) { s_take_snapshot_cb = cb; }
 void mqtt_set_delete_face_cb(mqtt_delete_face_cb_t cb) { s_delete_face_cb = cb; }
 void mqtt_set_enroll_face_cb(mqtt_enroll_face_cb_t cb) { s_enroll_face_cb = cb; }
 
@@ -37,24 +39,28 @@ static void handle_mqtt_command(const char* payload, int len) {
     if (root) {
         cJSON *action = cJSON_GetObjectItem(root, "action");
         if (action && action->valuestring) {
-            
+            // Xử lý các lệnh MQTT từ Web Dashboard (Vercel) hoặc Server AI (Gemini)
             if (strcmp(action->valuestring, "open_door") == 0) {
                 ESP_LOGI(TAG, "Lệnh Mở Cửa (MQTT)");
                 if (s_open_door_cb) s_open_door_cb();
-            } 
+            }
+            else if (strcmp(action->valuestring, "take_snapshot") == 0) {
+                ESP_LOGI(TAG, "[DISABLED] Lệnh Chụp Ảnh (MQTT) từ Gemini đã bị vô hiệu hóa.");
+                // if (s_take_snapshot_cb) s_take_snapshot_cb();
+            }
             else if (strcmp(action->valuestring, "delete_face") == 0) {
                 cJSON *id_item = cJSON_GetObjectItem(root, "id");
                 if (id_item && id_item->valuestring) {
                     ESP_LOGI(TAG, "Lệnh Xóa Khuôn Mặt: %s", id_item->valuestring);
                     if (s_delete_face_cb) s_delete_face_cb(id_item->valuestring);
                 } else {
-                    ESP_LOGW(TAG, "Lệnh delete_face thiếu tham số 'id'");
+                    ESP_LOGE(TAG, "Lệnh delete_face thiếu ID");
                 }
             }
             else if (strcmp(action->valuestring, "enroll_face") == 0) {
                 cJSON *name_item = cJSON_GetObjectItem(root, "name");
                 if (name_item && name_item->valuestring) {
-                    ESP_LOGI(TAG, "Lệnh Enroll Remote: %s", name_item->valuestring);
+                    ESP_LOGI(TAG, "Lệnh Đăng Ký Khuôn Mặt: %s", name_item->valuestring);
                     if (s_enroll_face_cb) s_enroll_face_cb(name_item->valuestring);
                 } else {
                     ESP_LOGW(TAG, "Lệnh enroll_face thiếu tham số 'name'");

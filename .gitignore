@@ -44,3 +44,6 @@ secrets.h
 
 # Reference repositories (comment out if you want to push this to your repo)
 xiaozhi-esp32/
+
+# API Backend
+smart-system-security-api/

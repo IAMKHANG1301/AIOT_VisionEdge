@@ -19,6 +19,7 @@ extern "C" {
 #include "supabase_client.h"
 #include "supabase_config.h"
 }
+#include "network.h"
 
 static const char* TAG = "DB_MANAGER";
 
@@ -154,6 +155,7 @@ static void enroll_upload_task(void* pv) {
 
 typedef struct {
     long timestamp;
+    long usec;
     char event[128];
     char person_id[32];
     uint8_t* image_data;
@@ -165,7 +167,7 @@ static void log_upload_task(void* pv) {
     char public_url[256] = "";
     if (args->image_data && args->image_size > 0) {
         char filename[64];
-        snprintf(filename, sizeof(filename), "L%ld.jpg", args->timestamp);
+        snprintf(filename, sizeof(filename), "L%ld_%03ld.jpg", args->timestamp, args->usec / 1000);
         
         esp_err_t up_err = supabase_upload_image("access_logs", filename, args->image_data, args->image_size);
         if (up_err == ESP_OK) {
@@ -176,6 +178,14 @@ static void log_upload_task(void* pv) {
         free(args->image_data);
     }
     supabase_insert_nhatkyravao(strlen(args->event) > 0 ? args->event : "UNKNOWN", args->person_id, public_url);
+    
+    // Nếu là người lạ, gọi HF upload sau khi Supabase đã upload xong.
+    // Việc này đảm bảo kết nối HTTPS tuần tự, không gây hết RAM mbedtls.
+    if (strcmp(args->event, "unknown") == 0 || strcmp(args->event, "spoof") == 0) {
+        ESP_LOGI(TAG, "Supabase upload done. Triggering HF upload for %s to Discord...", args->event);
+        upload_image_to_hf("/sdcard/snapshot.jpg", args->event);
+    }
+
     free(args);
     vTaskDelete(NULL);
 }
@@ -290,24 +300,13 @@ esp_err_t db_log_add(const char* event, const char* person_id, const uint8_t* im
     gettimeofday(&tv, NULL);
     long timestamp = tv.tv_sec;
 
-    char img_path[128] = "";
-    if (image_data && image_size > 0) {
-        sprintf(img_path, "%s/L%ld.jpg", LOGS_DIR, timestamp);
-        FILE* fi = fopen(img_path, "wb");
-        if (fi) {
-            fwrite(image_data, 1, image_size, fi);
-            fclose(fi);
-        }
-    }
-
     cJSON* arr = read_json_array(LOGS_JSON);
     cJSON* obj = cJSON_CreateObject();
     cJSON_AddNumberToObject(obj, "timestamp", timestamp);
     if (event) cJSON_AddStringToObject(obj, "event", event);
     if (person_id) cJSON_AddStringToObject(obj, "person_id", person_id);
-    if (strlen(img_path) > 0) {
-        cJSON_AddStringToObject(obj, "image", img_path);
-    }
+    
+    // Khong luu anh vao the nho nua de tranh day bo nho
     
     cJSON_AddItemToArray(arr, obj);
 
@@ -322,23 +321,21 @@ esp_err_t db_log_add(const char* event, const char* person_id, const uint8_t* im
     ESP_LOGI(TAG, "Added log event: %s", event ? event : "UNKNOWN");
     
     // Nâng cấp: Tải ảnh lên Supabase Storage trong background task để không block camera
-    log_upload_args_t* args = (log_upload_args_t*)malloc(sizeof(log_upload_args_t));
-    if (args) {
-        args->timestamp = timestamp;
-        if (event) strncpy(args->event, event, sizeof(args->event));
-        else args->event[0] = '\0';
-        if (person_id) strncpy(args->person_id, person_id, sizeof(args->person_id));
-        else args->person_id[0] = '\0';
-        
-        args->image_size = image_size;
-        args->image_data = NULL;
-        if (image_size > 0 && image_data) {
+    if (image_data && image_size > 0) {
+        log_upload_args_t* args = (log_upload_args_t*)malloc(sizeof(log_upload_args_t));
+        if (args) {
+            args->timestamp = tv.tv_sec;
+            args->usec = tv.tv_usec;
+            strncpy(args->event, event ? event : "", sizeof(args->event)-1);
+            strncpy(args->person_id, person_id ? person_id : "", sizeof(args->person_id)-1);
+            
+            args->image_size = image_size;
             args->image_data = (uint8_t*)malloc(image_size);
             if (args->image_data) {
                 memcpy(args->image_data, image_data, image_size);
             }
+            xTaskCreate(log_upload_task, "log_upload", 10240, args, 5, NULL);
         }
-        xTaskCreate(log_upload_task, "log_upload", 10240, args, 5, NULL);
     }
 
     return ESP_OK;

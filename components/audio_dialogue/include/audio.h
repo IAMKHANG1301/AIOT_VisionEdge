@@ -56,6 +56,13 @@ void audio_play(const uint8_t *data, int len);
  */
 void audio_play_chunk(const uint8_t *data, int len);
 
+/**
+ * @brief Feed raw PCM audio data from network into the playback RingBuffer.
+ * @param data  Pointer to PCM-16 mono audio data
+ * @param len   Length of data in bytes
+ */
+void audio_feed_ringbuffer(const uint8_t *data, size_t len);
+
 // =============================================================================
 // Hardware Test Functions (Phase 0 Validation)
 // =============================================================================
@@ -75,6 +82,12 @@ void audio_test_play_sine(void);
  *        Fail: file missing/empty → check INMP441 wiring and GPIO 48.
  */
 void audio_test_record_to_sd(void);
+
+/**
+ * @brief TEST: Toggle manual recording. Click once to start, again to stop and play.
+ */
+void audio_test_record_toggle(void);
+int audio_test_is_recording(void);
 
 #ifdef __cplusplus
 }

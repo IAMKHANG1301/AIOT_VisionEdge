@@ -45,11 +45,7 @@ vision_state_t vision_process_frame(void);
  */
 bool vision_add_known_face(int id, face_vector_t *vec);
 
-/**
- * @brief Check if the current detected face is smiling (Liveness test)
- * @return true if smile detected, false otherwise
- */
-bool vision_check_liveness(void);
+
 
 /**
  * @brief Start a simple local Web Server for MJPEG streaming
@@ -73,6 +69,11 @@ bool vision_delete_enrolled_face(const char* person_id);
  * @param name Tên của người cần đăng ký
  */
 void vision_trigger_remote_enroll(const char* name);
+
+/**
+ * @brief Chụp ảnh ngay lập tức và gửi lên Hugging Face qua WebSocket
+ */
+void vision_trigger_snapshot(void);
 
 #ifdef __cplusplus
 }
