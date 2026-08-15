@@ -772,7 +772,7 @@ static void ai_task(void *arg) {
                             tft_update_ui(TFT_COLOR_RED, "Phát hiện giả mạo!", recognized_name, "Vui lòng không sử dụng hình ảnh hoặc video");
                             ESP_LOGW(TAG, "SPOOFING DETECTED for %s! (Real score: %.2f)", recognized_name, real_score);
                             trigger_alarm();
-                            trigger_snapshot_and_upload("spoof", s_recognized_person_id, "SPOOF");
+                            trigger_snapshot_and_upload("spoofing", s_recognized_person_id, "SPOOF");
                         }
                     } else {
                         current_vision_state = VISION_KNOWN_PERSON;
